@@ -1,0 +1,6 @@
+*.o
+*.log
+/switch
+/host
+/swctl
+/switch_tsan
