@@ -3,7 +3,5 @@
 /switch
 /host
 /swctl
-/switch_tsan
-/host_tsan
 core
 core.*
