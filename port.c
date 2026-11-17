@@ -68,11 +68,12 @@ void port_stop(Port *port)
     }
 }
 
-int port_enqueue(Port *port, SharedFrame *frame)
+static int enqueue_generation(Port *port, SharedFrame *frame, uint64_t generation)
 {
-    int added = 0;
+    int added = -1;
     check_thread(pthread_mutex_lock(&port->lock), "lock port");
-    if (port->state == PORT_ACTIVE) {
+    if (port->state == PORT_ACTIVE && (generation == 0 || port->generation == generation)) {
+        added = 0;
         if (port->count == QUEUE_CAPACITY) {
             port->dropped++;
         } else {
@@ -88,6 +89,19 @@ int port_enqueue(Port *port, SharedFrame *frame)
     return added;
 }
 
+int port_enqueue(Port *port, SharedFrame *frame)
+{
+    return enqueue_generation(port, frame, 0) == 1;
+}
+
+static int broadcast(const uint8_t mac[MAC_SIZE])
+{
+    for (unsigned i = 0; i < MAC_SIZE; i++) {
+        if (mac[i] != 0xff) return 0;
+    }
+    return 1;
+}
+
 static void *receive_frames(void *argument)
 {
     Port *port = argument;
@@ -101,15 +115,44 @@ static void *receive_frames(void *argument)
         check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
         if (!active) break;
 
+        unsigned index = (unsigned)(port - port->all_ports), old_port = 0;
+        int learned = mac_learn(port->mac_table, frame.src, index, port->generation, &old_port);
+        if (learned == MAC_ERROR) {
+            perror("learn MAC");
+            break;
+        }
+        if (learned == MAC_LIMIT) {
+            check_thread(pthread_mutex_lock(&port->lock), "lock port");
+            port->dropped++;
+            check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
+            if (printf("port security: port %u exceeded MAC limit\n", index + 1) < 0 ||
+                fflush(stdout) == EOF) perror("print port security");
+            break; /* Stop this port; the violating frame is never forwarded. */
+        }
+        if (learned == MAC_MOVED) {
+            if (printf("MAC moved %02x:%02x:%02x:%02x:%02x:%02x port %u -> %u\n",
+                       frame.src[0], frame.src[1], frame.src[2], frame.src[3],
+                       frame.src[4], frame.src[5], old_port + 1, index + 1) < 0 ||
+                fflush(stdout) == EOF) {
+                perror("print MAC move");
+                break;
+            }
+        }
         SharedFrame *shared = shared_frame_create(&frame);
         if (shared == NULL) {
             perror("allocate shared frame");
             break;
         }
-        /* Until MAC learning is added, every destination is flooded. */
-        for (unsigned i = 0; i < port->num_ports; i++) {
-            if (&port->all_ports[i] != port) {
-                port_enqueue(&port->all_ports[i], shared);
+        MacLocation destination;
+        int flood = broadcast(frame.dst) || !mac_lookup(port->mac_table, frame.dst, &destination);
+        if (!flood && destination.port != index) {
+            /* A full known-destination queue drops, rather than flooding. */
+            flood = enqueue_generation(&port->all_ports[destination.port], shared,
+                                       destination.generation) == -1;
+        }
+        if (flood) {
+            for (unsigned i = 0; i < port->num_ports; i++) {
+                if (i != index) port_enqueue(&port->all_ports[i], shared);
             }
         }
         shared_frame_release(shared); /* Release the receiver's ownership. */
@@ -163,6 +206,7 @@ int port_start(Port *port, int fd)
     port->head = port->count = 0;
     port->frames_in = port->frames_out = port->dropped = 0;
     port->state = PORT_ACTIVE;
+    port->generation++;
     check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
 
     int error = pthread_create(&port->sender, NULL, send_frames, port);
@@ -195,7 +239,9 @@ int port_reap(Port *port, unsigned number)
         check_thread(pthread_join(port->sender, NULL), "join sender");
         port->sender_started = 0;
     }
-    int result = 0;
+    if (port->mac_table != NULL)
+        mac_forget_port(port->mac_table, (unsigned)(port - port->all_ports), port->generation);
+    int result = 1;
     if (close(port->fd) == -1) {
         perror("close port");
         result = -1;

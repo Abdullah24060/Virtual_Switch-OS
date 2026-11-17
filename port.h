@@ -2,6 +2,7 @@
 #define PORT_H
 
 #include "shared_frame.h"
+#include "mac_table.h"
 #include <stdint.h>
 
 #define QUEUE_CAPACITY 64
@@ -26,12 +27,14 @@ typedef struct Port {
     struct Port *all_ports;
     unsigned num_ports;
     int wake_fd;
+    MacTable *mac_table;
+    uint64_t generation; /* A new connection never inherits an old MAC mapping. */
 } Port;
 
 int port_init(Port *port, Port *all_ports, unsigned count, int wake_fd);
 int port_start(Port *port, int fd);
 void port_stop(Port *port);
-int port_reap(Port *port, unsigned number);
+int port_reap(Port *port, unsigned number); /* 1 = reaped, 0 = unchanged, -1 = error. */
 void port_destroy(Port *port);
 int port_is_free(Port *port);
 

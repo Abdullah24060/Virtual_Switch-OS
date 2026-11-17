@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "frame.h"
 #include "port.h"
+#include "admission.h"
 #include "sync.h"
 
 #include <arpa/inet.h>
@@ -56,81 +57,50 @@ static int read_events(int fd)
     return stopping;
 }
 
-static int run_switch(int listener, int wake_fd, Port *ports, unsigned count,
-                      const atomic_int *shutdown_requested)
+static int run_switch(Admission *admission, int wake_fd, const atomic_int *stopping)
 {
-    struct pollfd fds[2] = {
-        { .fd = listener, .events = POLLIN },
-        { .fd = wake_fd, .events = POLLIN }
-    };
+    struct pollfd fd = { .fd = wake_fd, .events = POLLIN };
     for (;;) {
-        if (poll(fds, 2, -1) == -1) {
+        if (poll(&fd, 1, -1) == -1) {
             if (errno == EINTR) continue;
             perror("poll");
             return 1;
         }
-        int stopping = 0;
-        if (fds[1].revents & POLLIN) {
-            stopping = read_events(wake_fd);
-            if (stopping == -1) {
-                perror("read events");
-                return 1;
-            }
-        }
-        for (unsigned i = 0; i < count; i++) {
-            if (port_reap(&ports[i], i + 1) == -1) return 1;
-        }
-        /* The flag preserves shutdown even if its notification pipe was full. */
-        if (stopping || atomic_load(shutdown_requested)) return 0;
-        if ((fds[0].revents | fds[1].revents) & (POLLERR | POLLHUP | POLLNVAL)) {
-            fprintf(stderr, "listener or notification pipe failed\n");
+        if (fd.revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            fprintf(stderr, "notification pipe failed\n");
             return 1;
         }
-        if (!(fds[0].revents & POLLIN)) continue;
-        int client = accept(listener, NULL, NULL);
-        if (client == -1) {
-            if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK ||
-                errno == ECONNABORTED) continue;
-            perror("accept");
+        if (read_events(wake_fd) == -1) {
+            perror("read events");
             return 1;
         }
-        unsigned i;
-        for (i = 0; i < count; i++) {
-            if (port_is_free(&ports[i])) break;
-        }
-        if (i == count) {
-            /* Timed semaphore admission is added in Day 1 Part 3. */
-            if (close(client) == -1) {
-                perror("close extra host");
-                return 1;
-            }
-            continue;
-        }
-        if (port_start(&ports[i], client) == -1) {
-            perror("start port threads");
-            return 1;
-        }
-        if (printf("port %u connected\n", i + 1) < 0 || fflush(stdout) == EOF) {
-            perror("print port");
-            return 1;
-        }
+        if (admission_reap(admission) == -1) return 1;
+        if (atomic_load(stopping)) return 0;
     }
 }
 
 int main(int argc, char *argv[])
 {
     unsigned tcp_port, num_ports;
+    unsigned capacity = 1024, mac_limit = 8, age_seconds = 60, wait_seconds = 5;
     int listener = -1, wake[2] = {-1, -1};
     int reuse = 1, status = 1, signal_started = 0;
     unsigned initialized = 0;
     Port *ports = NULL;
+    MacTable table;
+    Admission admission;
+    int mac_ready = 0, admission_ready = 0;
     pthread_t signal_thread;
     SignalContext signals;
     struct sockaddr_in address = {0};
 
-    if (argc != 3 || parse_number(argv[1], 1, 65535, &tcp_port) == -1 ||
-        parse_number(argv[2], 1, 65535, &num_ports) == -1) {
-        fprintf(stderr, "usage: ./switch <tcp_port> <num_ports>\n");
+    if ((argc != 3 && argc != 7) || parse_number(argv[1], 1, 65535, &tcp_port) == -1 ||
+        parse_number(argv[2], 1, 65535, &num_ports) == -1 ||
+        (argc == 7 && (parse_number(argv[3], 1, 1000000, &capacity) == -1 ||
+                       parse_number(argv[4], 1, 65535, &mac_limit) == -1 ||
+                       parse_number(argv[5], 1, 86400, &age_seconds) == -1 ||
+                       parse_number(argv[6], 1, 3600, &wait_seconds) == -1))) {
+        fprintf(stderr, "usage: ./switch <tcp_port> <num_ports> [mac_capacity macs_per_port age_seconds wait_seconds]\n");
         return 1;
     }
     atomic_init(&signals.stopping, 0);
@@ -151,7 +121,7 @@ int main(int argc, char *argv[])
     address.sin_port = htons((uint16_t)tcp_port);
     if (setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof reuse) == -1 ||
         bind(listener, (struct sockaddr *)&address, sizeof address) == -1 ||
-        listen(listener, (int)num_ports) == -1 || nonblocking(listener) == -1) {
+        listen(listener, (int)num_ports) == -1) {
         perror("set up listener");
         goto cleanup;
     }
@@ -159,6 +129,11 @@ int main(int argc, char *argv[])
         perror("set up notification pipe");
         goto cleanup;
     }
+    if (mac_table_init(&table, num_ports, capacity, mac_limit, age_seconds) == -1) {
+        perror("initialize MAC table");
+        goto cleanup;
+    }
+    mac_ready = 1;
     ports = calloc(num_ports, sizeof *ports);
     if (ports == NULL) {
         perror("allocate ports");
@@ -169,6 +144,17 @@ int main(int argc, char *argv[])
             perror("initialize port");
             goto cleanup;
         }
+        ports[initialized].mac_table = &table;
+    }
+    if (admission_init(&admission, ports, num_ports, listener, wake[1], wait_seconds,
+                       &signals.stopping) == -1) {
+        perror("initialize admission");
+        goto cleanup;
+    }
+    admission_ready = 1;
+    if (mac_start_aging(&table) == -1) {
+        perror("start aging thread");
+        goto cleanup;
     }
     signals.wake_fd = wake[1];
     int error = pthread_create(&signal_thread, NULL, wait_for_shutdown, &signals);
@@ -177,25 +163,41 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
     signal_started = 1;
+    if (admission_start(&admission) == -1) {
+        perror("start admission thread");
+        goto cleanup;
+    }
     if (printf("listening tcp_port=%u num_ports=%u queue_capacity=%d\n",
                tcp_port, num_ports, QUEUE_CAPACITY) < 0 || fflush(stdout) == EOF) {
         perror("print startup");
         goto cleanup;
     }
-    status = run_switch(listener, wake[0], ports, num_ports, &signals.stopping);
+    status = run_switch(&admission, wake[0], &signals.stopping);
 
 cleanup:
+    atomic_store(&signals.stopping, 1);
+    if (admission_ready) {
+        admission_stop(&admission);
+        if (admission.status != 0) status = 1;
+    }
+    if (mac_ready) mac_stop_aging(&table);
     if (listener != -1 && close(listener) == -1) {
         perror("close listener");
         status = 1;
     }
     for (unsigned i = 0; i < initialized; i++) port_stop(&ports[i]);
-    for (unsigned i = 0; i < initialized; i++) {
-        if (port_reap(&ports[i], i + 1) == -1) status = 1;
+    if (admission_ready) {
+        if (admission_reap(&admission) == -1) status = 1;
+    } else {
+        for (unsigned i = 0; i < initialized; i++) {
+            if (port_reap(&ports[i], i + 1) == -1) status = 1;
+        }
     }
     /* Receivers can inspect every port: join ALL before destroying ANY lock. */
     for (unsigned i = 0; i < initialized; i++) port_destroy(&ports[i]);
     free(ports);
+    if (admission_ready) admission_destroy(&admission);
+    if (mac_ready) mac_table_destroy(&table);
     if (signal_started) {
         /* Also wake sigwait if shutdown followed an error instead of a signal. */
         int error = pthread_kill(signal_thread, SIGTERM);

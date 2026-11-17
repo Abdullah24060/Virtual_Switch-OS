@@ -9,6 +9,30 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
+/* Admission failure is a short text reply, separate from ordinary data frames. */
+static int switch_is_full(int sock)
+{
+    unsigned char first;
+    ssize_t n;
+    do {
+        n = recv(sock, &first, 1, MSG_PEEK);
+    } while (n == -1 && errno == EINTR);
+    if (n == -1) return -1;
+    /* A valid frame length (0..1500) always starts with a byte from 0 to 5. */
+    if (n == 1 && first == 's') {
+        const char message[] = "switch full\n";
+        char reply[sizeof message - 1];
+        n = read_full(sock, reply, sizeof reply);
+        if (n == -1) return -1;
+        if (n != (ssize_t)sizeof reply || memcmp(reply, message, sizeof reply) != 0) {
+            errno = EPROTO;
+            return -1;
+        }
+        return 1;
+    }
+    return 0;
+}
+
 /* A line is: destination-MAC VLAN priority [text payload]. */
 static int send_line(int sock, char *line, const uint8_t src[MAC_SIZE])
 {
@@ -69,6 +93,12 @@ static int run_host(int sock, const uint8_t src[MAC_SIZE])
             return 1;
         }
         if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
+            int full = switch_is_full(sock);
+            if (full != 0) {
+                if (full == 1) fprintf(stderr, "switch full\n");
+                else perror("receive frame");
+                return 1;
+            }
             Frame frame;
             int result = frame_read(sock, &frame);
             if (result == 0) return 0;
