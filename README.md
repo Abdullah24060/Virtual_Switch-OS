@@ -56,10 +56,11 @@ ff:ff:ff:ff:ff:ff 1 1 hello everyone
 
 A host must send a frame before the switch can learn its MAC. The source MAC
 comes from the host argument and the payload length is calculated automatically.
-VLANs are 1–4094 and priorities are 0 (high), 1 (normal), or 2 (low). Received
-payloads appear in hexadecimal. Ctrl-D on empty input disconnects the host;
-the switch prints its input, output and drop counters. `make clean` removes
-generated programs and object files.
+VLANs are 1–4094 and priorities are 0 (high), 1 (normal), or 2 (low). The host
+shows printable ASCII as text (`payload=hello B`) and other bytes as hex
+(`payload_hex=00ff`). Ctrl-D on empty input disconnects the host. The switch
+prints its input, output and drop counters. `make clean` removes generated
+programs and object files.
 
 ## Limits
 

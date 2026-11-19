@@ -118,19 +118,32 @@ int frame_write(int fd, const Frame *frame)
 
 int frame_print(const char *label, const Frame *frame)
 {
+    int text = 1;
+    for (size_t i = 0; i < frame->length; i++) {
+        if (frame->payload[i] < ' ' || frame->payload[i] > '~') {
+            text = 0;
+            break;
+        }
+    }
     if (printf("%s length=%u src=%02x:%02x:%02x:%02x:%02x:%02x "
-               "dst=%02x:%02x:%02x:%02x:%02x:%02x vlan=%u priority=%u payload=",
+               "dst=%02x:%02x:%02x:%02x:%02x:%02x vlan=%u priority=%u payload%s=",
                label, (unsigned)frame->length,
                frame->src[0], frame->src[1], frame->src[2], frame->src[3],
                frame->src[4], frame->src[5], frame->dst[0], frame->dst[1],
                frame->dst[2], frame->dst[3], frame->dst[4], frame->dst[5],
-               (unsigned)frame->vlan, (unsigned)frame->priority) < 0) {
+               (unsigned)frame->vlan, (unsigned)frame->priority, text ? "" : "_hex") < 0) {
         return -1;
     }
-    /* Hex also displays zero bytes and non-text payloads without ambiguity. */
-    for (size_t i = 0; i < frame->length; i++) {
-        if (printf("%02x", frame->payload[i]) < 0) {
+    if (text) {
+        if (fwrite(frame->payload, 1, frame->length, stdout) != frame->length) {
             return -1;
+        }
+    } else {
+        /* Keep binary bytes and terminal control characters visible as hex. */
+        for (size_t i = 0; i < frame->length; i++) {
+            if (printf("%02x", frame->payload[i]) < 0) {
+                return -1;
+            }
         }
     }
     if (putchar('\n') == EOF || fflush(stdout) == EOF) {
