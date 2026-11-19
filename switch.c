@@ -2,6 +2,7 @@
 #include "frame.h"
 #include "port.h"
 #include "admission.h"
+#include "options.h"
 #include "sync.h"
 
 #include <arpa/inet.h>
@@ -81,9 +82,7 @@ static int run_switch(Admission *admission, int wake_fd, const atomic_int *stopp
 
 int main(int argc, char *argv[])
 {
-    unsigned tcp_port, num_ports;
-    unsigned capacity = 1024, mac_limit = 8, age_seconds = 60, wait_seconds = 5;
-    unsigned send_rate = DEFAULT_SEND_RATE;
+    SwitchOptions options;
     int listener = -1, wake[2] = {-1, -1};
     int reuse = 1, status = 1, signal_started = 0;
     unsigned initialized = 0;
@@ -96,25 +95,20 @@ int main(int argc, char *argv[])
     SignalContext signals;
     struct sockaddr_in address = {0};
 
-    int has_rate = argc >= 5 && strcmp(argv[argc - 2], "--rate") == 0;
-    int base_argc = argc - (has_rate ? 2 : 0);
-    if ((base_argc != 3 && base_argc != 7) || parse_number(argv[1], 1, 65535, &tcp_port) == -1 ||
-        parse_number(argv[2], 1, 65535, &num_ports) == -1 ||
-        (base_argc == 7 && (parse_number(argv[3], 1, 1000000, &capacity) == -1 ||
-                       parse_number(argv[4], 1, 65535, &mac_limit) == -1 ||
-                       parse_number(argv[5], 1, 86400, &age_seconds) == -1 ||
-                       parse_number(argv[6], 1, 3600, &wait_seconds) == -1)) ||
-        (has_rate && parse_number(argv[argc - 1], 1, MAX_SEND_RATE, &send_rate) == -1)) {
-        fprintf(stderr, "usage: ./switch <tcp_port> <num_ports>"
-                        " [mac_capacity macs_per_port age_seconds wait_seconds] [--rate frames_per_second]\n");
+    if (parse_options(argc, argv, &options) == -1) {
+        if (errno == EINVAL) print_switch_usage();
+        else perror("parse switch options");
+        free(options.vlans);
         return 1;
     }
+    unsigned tcp_port = options.tcp_port, num_ports = options.num_ports;
+    unsigned send_rate = options.send_rate;
     atomic_init(&signals.stopping, 0);
     if (ignore_sigpipe() == -1 || sigemptyset(&signals.signals) == -1 ||
         sigaddset(&signals.signals, SIGINT) == -1 ||
         sigaddset(&signals.signals, SIGTERM) == -1) {
         perror("set up signals");
-        return 1;
+        goto cleanup;
     }
     check_thread(pthread_sigmask(SIG_BLOCK, &signals.signals, NULL), "block signals");
     listener = socket(AF_INET, SOCK_STREAM, 0);
@@ -135,7 +129,8 @@ int main(int argc, char *argv[])
         perror("set up notification pipe");
         goto cleanup;
     }
-    if (mac_table_init(&table, num_ports, capacity, mac_limit, age_seconds) == -1) {
+    if (mac_table_init(&table, num_ports, options.capacity,
+                       options.mac_limit, options.age_seconds) == -1) {
         perror("initialize MAC table");
         goto cleanup;
     }
@@ -153,8 +148,14 @@ int main(int argc, char *argv[])
         ports[initialized].mac_table = &table;
         ports[initialized].rate_timer = &rate_timer;
         ports[initialized].send_interval_ns = (NS_PER_SECOND + send_rate - 1) / send_rate;
+        if (options.vlans[initialized] != 0)
+            ports[initialized].vlan = options.vlans[initialized];
+        ports[initialized].trunk = initialized + 1 == options.trunk;
+        ports[initialized].sniffer = initialized + 1 == options.sniffer;
     }
-    if (admission_init(&admission, ports, num_ports, listener, wake[1], wait_seconds,
+    if (options.mirror_source != 0)
+        ports[options.mirror_source - 1].mirror_to = &ports[options.sniffer - 1];
+    if (admission_init(&admission, ports, num_ports, listener, wake[1], options.wait_seconds,
                        &signals.stopping) == -1) {
         perror("initialize admission");
         goto cleanup;
@@ -188,6 +189,7 @@ int main(int argc, char *argv[])
     status = run_switch(&admission, wake[0], &signals.stopping);
 
 cleanup:
+    free(options.vlans);
     atomic_store(&signals.stopping, 1);
     if (admission_ready) {
         admission_stop(&admission);

@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -std=c11 -Wall -Wextra -Werror -g -O0
 LDLIBS = -pthread
-SWITCH_SRC = switch.c port.c shared_frame.c frame.c mac_table.c admission.c qos.c rate_timer.c
+SWITCH_SRC = switch.c port.c shared_frame.c frame.c mac_table.c admission.c qos.c rate_timer.c options.c
 
 .PHONY: all clean
 
@@ -18,6 +18,8 @@ host: host.o frame.o
 
 switch.o port.o admission.o rate_timer.o: port.h qos.h rate_timer.h shared_frame.h sync.h mac_table.h frame.h
 switch.o admission.o: admission.h
+switch.o options.o: options.h
+options.o: frame.h rate_timer.h
 mac_table.o: mac_table.h sync.h frame.h
 qos.o: qos.h shared_frame.h frame.h
 shared_frame.o: shared_frame.h sync.h frame.h

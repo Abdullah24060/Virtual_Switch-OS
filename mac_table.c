@@ -8,6 +8,7 @@
 
 static unsigned bucket_for(const uint8_t mac[MAC_SIZE])
 {
+    /* Keep the same MAC's VLAN entries together for the per-port MAC limit. */
     unsigned hash = 2166136261u;
     for (unsigned i = 0; i < MAC_SIZE; i++) hash = (hash ^ mac[i]) * 16777619u;
     return hash % MAC_BUCKETS;
@@ -30,12 +31,22 @@ static int expired(MacTable *table, MacEntry *entry, struct timespec time)
            (seconds == table->age_seconds && time.tv_nsec >= entry->seen.tv_nsec);
 }
 
-static MacEntry *find(MacBucket *bucket, const uint8_t mac[MAC_SIZE])
+static MacEntry *find(MacBucket *bucket, const uint8_t mac[MAC_SIZE], uint16_t vlan)
 {
     for (MacEntry *entry = bucket->head; entry != NULL; entry = entry->next) {
-        if (memcmp(entry->mac, mac, MAC_SIZE) == 0) return entry;
+        if (entry->vlan == vlan && memcmp(entry->mac, mac, MAC_SIZE) == 0) return entry;
     }
     return NULL;
+}
+
+static int has_address(const MacBucket *bucket, const uint8_t mac[MAC_SIZE],
+                       unsigned port, const MacEntry *skip)
+{
+    for (const MacEntry *entry = bucket->head; entry != NULL; entry = entry->next) {
+        if (entry != skip && entry->port == port && memcmp(entry->mac, mac, MAC_SIZE) == 0)
+            return 1;
+    }
+    return 0;
 }
 
 static void touch(MacTable *table, MacEntry *entry, struct timespec time)
@@ -45,11 +56,11 @@ static void touch(MacTable *table, MacEntry *entry, struct timespec time)
 }
 
 /* Caller holds changes and the entry's bucket lock. */
-static void remove_entry(MacTable *table, MacEntry **link)
+static void remove_entry(MacTable *table, MacBucket *bucket, MacEntry **link)
 {
     MacEntry *entry = *link;
     *link = entry->next;
-    table->per_port[entry->port]--;
+    if (!has_address(bucket, entry->mac, entry->port, NULL)) table->per_port[entry->port]--;
     table->count--;
     free(entry);
 }
@@ -61,7 +72,7 @@ static void age_locked(MacTable *table, struct timespec time)
         check_thread(pthread_mutex_lock(&bucket->lock), "lock MAC bucket");
         MacEntry **link = &bucket->head;
         while (*link != NULL) {
-            if (expired(table, *link, time)) remove_entry(table, link);
+            if (expired(table, *link, time)) remove_entry(table, bucket, link);
             else link = &(*link)->next;
         }
         check_thread(pthread_mutex_unlock(&bucket->lock), "unlock MAC bucket");
@@ -75,12 +86,13 @@ void mac_age(MacTable *table)
     check_thread(pthread_mutex_unlock(&table->changes), "unlock MAC changes");
 }
 
-int mac_lookup(MacTable *table, const uint8_t mac[MAC_SIZE], MacLocation *location)
+int mac_lookup(MacTable *table, const uint8_t mac[MAC_SIZE], uint16_t vlan,
+               MacLocation *location)
 {
     MacBucket *bucket = &table->buckets[bucket_for(mac)];
     int found = 0;
     check_thread(pthread_mutex_lock(&bucket->lock), "lock MAC bucket");
-    MacEntry *entry = find(bucket, mac);
+    MacEntry *entry = find(bucket, mac, vlan);
     if (entry != NULL && !expired(table, entry, now())) {
         location->port = entry->port;
         location->generation = entry->generation;
@@ -102,17 +114,18 @@ static void evict_oldest(MacTable *table)
             if (oldest == NULL || (*link)->used < (*oldest)->used) oldest = link;
         }
     }
-    if (oldest != NULL) remove_entry(table, oldest);
+    if (oldest != NULL)
+        remove_entry(table, &table->buckets[bucket_for((*oldest)->mac)], oldest);
     for (unsigned i = MAC_BUCKETS; i > 0; i--)
         check_thread(pthread_mutex_unlock(&table->buckets[i - 1].lock), "unlock eviction bucket");
 }
 
-int mac_learn(MacTable *table, const uint8_t mac[MAC_SIZE], unsigned port,
+int mac_learn(MacTable *table, const uint8_t mac[MAC_SIZE], uint16_t vlan, unsigned port,
               uint64_t generation, unsigned *old_port)
 {
     MacBucket *bucket = &table->buckets[bucket_for(mac)];
     check_thread(pthread_mutex_lock(&bucket->lock), "lock MAC bucket");
-    MacEntry *entry = find(bucket, mac);
+    MacEntry *entry = find(bucket, mac, vlan);
     if (entry != NULL && entry->port == port && entry->generation == generation) {
         touch(table, entry, now());
         check_thread(pthread_mutex_unlock(&bucket->lock), "unlock MAC bucket");
@@ -124,16 +137,17 @@ int mac_learn(MacTable *table, const uint8_t mac[MAC_SIZE], unsigned port,
     if (table->count == table->capacity || table->per_port[port] >= table->per_port_limit)
         age_locked(table, now());
     check_thread(pthread_mutex_lock(&bucket->lock), "lock MAC bucket");
-    entry = find(bucket, mac); /* Recheck after acquiring structural ownership. */
+    entry = find(bucket, mac, vlan); /* Recheck after acquiring structural ownership. */
     int result = MAC_OK;
     if (entry != NULL && entry->port == port && entry->generation == generation) {
         touch(table, entry, now());
-    } else if (table->per_port[port] >= table->per_port_limit) {
+    } else if (table->per_port[port] >= table->per_port_limit &&
+               !has_address(bucket, mac, port, NULL)) {
         result = MAC_LIMIT;
     } else if (entry != NULL) {
         *old_port = entry->port;
-        table->per_port[entry->port]--;
-        table->per_port[port]++;
+        if (!has_address(bucket, mac, entry->port, entry)) table->per_port[entry->port]--;
+        if (!has_address(bucket, mac, port, NULL)) table->per_port[port]++;
         entry->port = port;
         entry->generation = generation;
         touch(table, entry, now());
@@ -148,13 +162,14 @@ int mac_learn(MacTable *table, const uint8_t mac[MAC_SIZE], unsigned port,
             if (table->count == table->capacity) evict_oldest(table);
             check_thread(pthread_mutex_lock(&bucket->lock), "lock MAC bucket");
             memcpy(entry->mac, mac, MAC_SIZE);
+            entry->vlan = vlan;
             entry->port = port;
             entry->generation = generation;
             touch(table, entry, now());
+            if (!has_address(bucket, mac, port, NULL)) table->per_port[port]++;
             entry->next = bucket->head;
             bucket->head = entry;
             table->count++;
-            table->per_port[port]++;
         }
     }
     check_thread(pthread_mutex_unlock(&bucket->lock), "unlock MAC bucket");
@@ -171,7 +186,7 @@ void mac_forget_port(MacTable *table, unsigned port, uint64_t generation)
         MacEntry **link = &bucket->head;
         while (*link != NULL) {
             if ((*link)->port == port && (*link)->generation == generation)
-                remove_entry(table, link);
+                remove_entry(table, bucket, link);
             else link = &(*link)->next;
         }
         check_thread(pthread_mutex_unlock(&bucket->lock), "unlock MAC bucket");

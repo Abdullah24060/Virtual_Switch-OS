@@ -10,6 +10,7 @@
 
 typedef struct MacEntry {
     uint8_t mac[MAC_SIZE];
+    uint16_t vlan;
     unsigned port;
     uint64_t generation, used;
     struct timespec seen;
@@ -26,7 +27,8 @@ typedef struct {
     /* Only structural changes take this lock, not lookups or same-port refreshes. */
     pthread_mutex_t changes;
     size_t count, capacity;
-    unsigned *per_port, num_ports, per_port_limit, age_seconds;
+    unsigned *per_port; /* Distinct MAC addresses, even across several VLANs on a trunk. */
+    unsigned num_ports, per_port_limit, age_seconds;
     atomic_uint_fast64_t sequence;
     pthread_mutex_t aging_lock;
     pthread_cond_t aging_wake;
@@ -46,9 +48,10 @@ int mac_table_init(MacTable *table, unsigned ports, size_t capacity,
 int mac_start_aging(MacTable *table);
 void mac_stop_aging(MacTable *table);
 void mac_table_destroy(MacTable *table);
-int mac_learn(MacTable *table, const uint8_t mac[MAC_SIZE], unsigned port,
+int mac_learn(MacTable *table, const uint8_t mac[MAC_SIZE], uint16_t vlan, unsigned port,
               uint64_t generation, unsigned *old_port);
-int mac_lookup(MacTable *table, const uint8_t mac[MAC_SIZE], MacLocation *location);
+int mac_lookup(MacTable *table, const uint8_t mac[MAC_SIZE], uint16_t vlan,
+               MacLocation *location);
 void mac_forget_port(MacTable *table, unsigned port, uint64_t generation);
 void mac_age(MacTable *table);
 

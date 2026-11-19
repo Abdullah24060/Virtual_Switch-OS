@@ -9,14 +9,17 @@
 typedef enum { PORT_FREE, PORT_ACTIVE, PORT_CLOSING } PortState;
 
 typedef struct Port {
-    /* The lock protects state, output queues, token bucket and counters. */
+    /* The lock protects state, forwarding settings, queues, token and counters. */
     pthread_mutex_t lock;
     pthread_cond_t not_empty;
     PortState state;
     OutputQueues output;
     int send_token;
     uint64_t refill_at;
-    uint64_t frames_in, frames_out, dropped;
+    uint64_t frames_in, frames_out, dropped, mirrored;
+    uint16_t vlan;
+    int trunk, sniffer;
+    struct Port *mirror_to;
 
     /* Main sets fd before starting workers, and closes it after joining them. */
     int fd;

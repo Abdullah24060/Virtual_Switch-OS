@@ -1,7 +1,7 @@
 # Virtual Switch — Operating Systems Fall 2026
 
-A software network switch written in C for Linux. Tier 1, priority scheduling
-and rate limiting are implemented.
+A software network switch written in C for Linux. It supports Tier 1 switching,
+priority scheduling, rate limiting, VLANs, a trunk and port mirroring.
 
 ## What works
 
@@ -15,18 +15,19 @@ and rate limiting are implemented.
   arrival order within their class.
 - A timer refills a one-token bucket for each port. A port can send immediately
   after connecting or sitting idle, then waits for a token between frames.
-- MAC learning with 32 bucket locks, aging, exact LRU eviction and MAC moves.
-  Known destinations receive unicast; unknown destinations and broadcasts flood
-  every other port. Frames addressed back to their incoming port are filtered.
+- VLAN-aware MAC learning with 32 bucket locks, aging, exact LRU eviction and
+  MAC moves. Known destinations receive unicast. Unknown destinations and
+  broadcasts flood within the frame's VLAN and to the trunk. Frames addressed
+  back to their incoming port are filtered.
 - Per-port MAC limits: exceeding the limit shuts down that port. Its resources
   and learned entries are cleaned up before another connection can reuse it.
 - A counting semaphore limits connected hosts. An extra host waits for a free
   port, then receives `switch full` and disconnects if the timeout expires.
 - Clean Ctrl-C shutdown, with every thread joined and shared frame released.
 
-MAC moves and security events appear in the switch terminal. VLAN IDs are
-carried in frames. VLAN isolation, administration and file logging are planned
-for the remaining Tier 2 parts.
+MAC moves and security events appear in the switch terminal. VLAN, trunk and
+mirror settings are set at startup. Live administration and file logging are
+planned for the remaining Tier 2 parts.
 
 ## Build and run
 
@@ -59,14 +60,39 @@ comes from the host argument and the payload length is calculated automatically.
 VLANs are 1–4094 and priorities are 0 (high), 1 (normal), or 2 (low). The host
 shows printable ASCII as text (`payload=hello B`) and other bytes as hex
 (`payload_hex=00ff`). Ctrl-D on empty input disconnects the host. The switch
-prints its input, output and drop counters. `make clean` removes generated
+prints its input, output, drop and mirror counters. `make clean` removes generated
 programs and object files.
+
+## VLANs, trunk and mirror
+
+Port numbers are the one-based logical numbers printed when each host connects.
+On a fresh switch, connections take the lowest free port in order.
+
+| Option | Effect |
+| --- | --- |
+| `--vlan PORT VLAN_ID` | Sets the VLAN of a normal port. Repeat for other ports. The default is VLAN 1. |
+| `--trunk PORT` | Allows one port to send and receive any valid VLAN tag. Tags are preserved. |
+| `--mirror SOURCE SNIFFER` | Copies accepted ingress and successfully written egress traffic on one source port to a dedicated receive-only sniffer. A trunk can be the source. |
+
+For example, ports 1 and 2 share VLAN 10, port 3 is on VLAN 20, port 4 is
+the trunk and port 5 monitors port 1:
+
+```bash
+./switch 9000 5 --vlan 1 10 --vlan 2 10 --vlan 3 20 --trunk 4 --mirror 1 5
+```
+
+Use the access port's VLAN in its host input. A wrong tag is dropped before
+MAC learning. A sniffer is excluded from ordinary forwarding and its own
+input is discarded. It receives mirror copies with the original VLAN and
+priority. Copies use the sniffer's bounded queues and rate limit. A full
+sniffer queue drops the mirror copy while ordinary forwarding continues.
+The source port's `mirrored` counter counts copies queued successfully.
 
 ## Limits
 
-Defaults: **1024 MAC entries**, **8 learned MACs per port**, **60-second source
-aging**, and a **5-second admission timeout**. Destination lookups update LRU
-order but do not refresh source aging.
+Defaults: **1024 VLAN/MAC entries**, **8 distinct learned MACs per port**,
+**60-second source aging**, and a **5-second admission timeout**. Destination
+lookups update LRU order but do not refresh source aging.
 
 To override defaults, provide all four extra arguments:
 
@@ -84,5 +110,6 @@ Capacity accepts 1–1000000, MACs per port 1–65535, age 1–86400 seconds and
 1–3600 seconds. TCP port and number of switch ports accept 1–65535.
 
 The default send limit is **1,000 frames per second per port**. Add
-`--rate <frames_per_second>` as the last two arguments to set the initial rate
-for all ports. Each port has its own token bucket.
+`--rate <frames_per_second>` to set the initial rate for all ports. Each port has
+its own token bucket. Place flags after the required arguments and any optional
+positional limits.
