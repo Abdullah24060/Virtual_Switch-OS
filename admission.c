@@ -41,6 +41,7 @@ static int admit_host(Admission *admission, int client)
             }
             if (!atomic_load(admission->stopping)) {
                 const char reply[] = "switch full\n";
+                logger_event(admission->ports[0].logger, 0, "host admission timed out: switch full");
                 if (write_full(client, reply, sizeof reply - 1) == -1 &&
                     errno != EPIPE && errno != ECONNRESET) perror("send switch full");
             }
@@ -68,8 +69,8 @@ static int admit_host(Admission *admission, int client)
         return -1;
     }
     result = port_start(&admission->ports[i], client); /* Port now owns client. */
-    if (result == 0 && (printf("port %u connected\n", i + 1) < 0 || fflush(stdout) == EOF))
-        result = -1;
+    if (result == 0)
+        logger_event(admission->ports[i].logger, 1, "port %u connected", i + 1);
     check_thread(pthread_mutex_unlock(&admission->table_lock), "unlock port table");
     return result;
 }

@@ -182,30 +182,27 @@ static void *receive_frames(void *argument)
         check_thread(pthread_rwlock_unlock(port->forwarding), "unlock forwarding");
         if (learned == FORWARD_STOP) break;
         if (learned == MAC_ERROR) {
-            perror("process frame");
+            logger_event(port->logger, 0, "port %u could not process frame (errno=%d)",
+                         index + 1, errno);
             break;
         }
         if (learned == MAC_LIMIT) {
-            if (printf("port security: port %u exceeded MAC limit\n", index + 1) < 0 ||
-                fflush(stdout) == EOF) perror("print port security");
+            logger_event(port->logger, 1, "port security: port %u exceeded MAC limit", index + 1);
             break; /* Stop this port; the violating frame is never forwarded. */
         }
         if (learned == MAC_MOVED) {
-            if (printf("MAC moved %02x:%02x:%02x:%02x:%02x:%02x port %u -> %u vlan=%u\n",
-                       frame.src[0], frame.src[1], frame.src[2], frame.src[3],
-                       frame.src[4], frame.src[5], old_port + 1, index + 1,
-                       (unsigned)frame.vlan) < 0 ||
-                fflush(stdout) == EOF) {
-                perror("print MAC move");
-                break;
-            }
+            logger_event(port->logger, 1, "MAC moved %02x:%02x:%02x:%02x:%02x:%02x port %u -> %u vlan=%u",
+                         frame.src[0], frame.src[1], frame.src[2], frame.src[3],
+                         frame.src[4], frame.src[5], old_port + 1, index + 1,
+                         (unsigned)frame.vlan);
         }
     }
     if (result == -1) {
         check_thread(pthread_mutex_lock(&port->lock), "lock port");
         int active = port->state == PORT_ACTIVE;
         check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
-        if (active) perror("host frame");
+        if (active) logger_event(port->logger, 0, "port %u rejected host frame (errno=%d)",
+                                 index + 1, errno);
     }
     port_stop(port);
     return NULL;
@@ -335,12 +332,8 @@ int port_reap(Port *port, unsigned number)
     port->fd = -1;
     port->state = PORT_FREE;
     check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
-    if (printf("port %u disconnected in=%" PRIu64 " out=%" PRIu64 " dropped=%" PRIu64
-               " mirrored=%" PRIu64 "\n", number, in, out, dropped, mirrored) < 0 ||
-        fflush(stdout) == EOF) {
-        perror("print port counters");
-        result = -1;
-    }
+    logger_event(port->logger, 1, "port %u disconnected in=%" PRIu64 " out=%" PRIu64
+                 " dropped=%" PRIu64 " mirrored=%" PRIu64, number, in, out, dropped, mirrored);
     return result;
 }
 

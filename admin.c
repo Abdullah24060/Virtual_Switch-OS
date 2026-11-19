@@ -12,6 +12,7 @@
 typedef struct {
     const char *state, *role;
     unsigned vlan, mirror;
+    unsigned rate;
 } PortInfo;
 
 static int reply(int fd, const char *message)
@@ -34,14 +35,15 @@ static int show_ports(Admin *admin, int fd)
         info[i].role = p->trunk ? "trunk" : p->sniffer ? "sniffer" : "access";
         info[i].vlan = p->trunk || p->sniffer ? 0 : p->vlan;
         info[i].mirror = p->mirror_to == NULL ? 0 : (unsigned)(p->mirror_to - a->ports) + 1;
+        info[i].rate = (unsigned)((NS_PER_SECOND + p->send_interval_ns / 2) / p->send_interval_ns);
         check_thread(pthread_mutex_unlock(&p->lock), "unlock port");
     }
     check_thread(pthread_rwlock_unlock(&a->forwarding), "unlock forwarding");
     int status = reply(fd, "OK");
     for (unsigned i = 0; status == 0 && i < a->count; i++) {
         PortInfo row = info[i];
-        if (dprintf(fd, "port %u state=%s role=%s vlan=%u mirror=%u\n", i + 1,
-                    row.state, row.role, row.vlan, row.mirror) < 0)
+        if (dprintf(fd, "port %u state=%s role=%s vlan=%u mirror=%u rate=%u\n", i + 1,
+                    row.state, row.role, row.vlan, row.mirror, row.rate) < 0)
             status = -1;
     }
     free(info);
@@ -52,7 +54,10 @@ static int show_mac(Admin *admin, int fd)
 {
     MacRecord *records;
     size_t count;
-    if (mac_snapshot(admin->mac, &records, &count) == -1)
+    check_thread(pthread_rwlock_rdlock(&admin->admission->forwarding), "lock forwarding");
+    int snapshot = mac_snapshot(admin->mac, &records, &count);
+    check_thread(pthread_rwlock_unlock(&admin->admission->forwarding), "unlock forwarding");
+    if (snapshot == -1)
         return reply(fd, "ERR cannot allocate MAC snapshot");
     int status = dprintf(fd, "OK\nMAC table (%zu entries)\n", count) < 0 ? -1 : 0;
     for (size_t i = 0; status == 0 && i < count; i++) {
@@ -108,9 +113,12 @@ static int set_mirror(Admin *admin, unsigned from, unsigned to)
 {
     Admission *a = admin->admission;
     Port *source = &a->ports[from], *target = &a->ports[to];
-    /* Trunk designation is set at startup. */
-    if (from == to || target->trunk) return 0;
+    if (from == to) return 0;
     check_thread(pthread_rwlock_wrlock(&a->forwarding), "lock forwarding for mirror");
+    if (target->trunk) {
+        check_thread(pthread_rwlock_unlock(&a->forwarding), "unlock forwarding");
+        return 0;
+    }
     if (admin->mirror_source != NULL && admin->mirror_source != source)
         set_mirror_target(admin->mirror_source, NULL);
     if (admin->sniffer != target) {
@@ -126,6 +134,47 @@ static int set_mirror(Admin *admin, unsigned from, unsigned to)
     admin->sniffer = target;
     check_thread(pthread_rwlock_unlock(&a->forwarding), "unlock forwarding");
     return 1;
+}
+
+void admin_apply_config(Admin *admin, const SwitchOptions *config)
+{
+    Admission *a = admin->admission;
+    Port *source = config->mirror_source != 0 ? &a->ports[config->mirror_source - 1] : NULL;
+    Port *sniffer = config->sniffer != 0 ? &a->ports[config->sniffer - 1] : NULL;
+    uint64_t interval = (NS_PER_SECOND + config->send_rate - 1) / config->send_rate;
+    int rate_changed = 0;
+    check_thread(pthread_rwlock_wrlock(&a->forwarding), "lock forwarding for reload");
+    for (unsigned i = 0; i < a->count; i++) {
+        Port *port = &a->ports[i];
+        uint16_t vlan = config->vlans[i] != 0 ? config->vlans[i] : 1;
+        int trunk = i + 1 == config->trunk;
+        int is_sniffer = port == sniffer;
+        check_thread(pthread_mutex_lock(&port->lock), "lock port");
+        int role_changed = port->vlan != vlan || port->trunk != trunk || port->sniffer != is_sniffer;
+        int forget = role_changed && port->state != PORT_FREE;
+        uint64_t generation = port->generation;
+        port->vlan = vlan;
+        port->trunk = trunk;
+        port->sniffer = is_sniffer;
+        port->mirror_to = port == source ? sniffer : NULL;
+        if (role_changed || (is_sniffer && admin->mirror_source != source))
+            port_discard_output(port);
+        if (port->send_interval_ns != interval) {
+            if (port->refill_at != 0 && port->state == PORT_ACTIVE) {
+                port->refill_at = port->refill_at - port->send_interval_ns + interval;
+                port->send_token = monotonic_ns() >= port->refill_at;
+                check_thread(pthread_cond_signal(&port->not_empty), "wake sender after rate change");
+            }
+            port->send_interval_ns = interval;
+            rate_changed = 1;
+        }
+        check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
+        if (forget) mac_forget_port(admin->mac, i, generation);
+    }
+    admin->mirror_source = source;
+    admin->sniffer = sniffer;
+    check_thread(pthread_rwlock_unlock(&a->forwarding), "unlock forwarding");
+    if (rate_changed) rate_timer_notify(a->ports[0].rate_timer);
 }
 
 static int command(Admin *admin, int fd, char *line)
@@ -147,28 +196,33 @@ static int command(Admin *admin, int fd, char *line)
         check_thread(pthread_rwlock_wrlock(&admin->admission->forwarding), "lock forwarding for clear");
         mac_clear(admin->mac);
         check_thread(pthread_rwlock_unlock(&admin->admission->forwarding), "unlock forwarding");
+        logger_event(admin->logger, 0, "admin cleared MAC table");
         return dprintf(fd, "OK\nMAC table cleared\n") < 0 ? -1 : 0;
     }
     if (n >= 2 && parse_number(words[1], 1, admin->admission->count, &port) == 0) {
         if (n == 2 && strcmp(words[0], "shutdown") == 0) {
             if (admission_shutdown_port(admin->admission, port - 1) == -1)
                 return reply(fd, "ERR could not shut down port");
+            logger_event(admin->logger, 0, "admin shut down port %u", port);
             return dprintf(fd, "OK\nport %u down\n", port) < 0 ? -1 : 0;
         }
         if (n == 2 && strcmp(words[0], "up") == 0) {
             if (admission_up_port(admin->admission, port - 1) == -1)
                 return reply(fd, "ERR could not enable port");
+            logger_event(admin->logger, 0, "admin enabled port %u", port);
             return dprintf(fd, "OK\nport %u enabled\n", port) < 0 ? -1 : 0;
         }
         if (n == 3 && strcmp(words[0], "vlan") == 0 && parse_number(words[2], 1, 4094, &value) == 0) {
             if (!set_vlan(admin, port - 1, (uint16_t)value))
                 return reply(fd, "ERR VLAN changes require an access port");
+            logger_event(admin->logger, 0, "admin set port %u VLAN to %u", port, value);
             return dprintf(fd, "OK\nport %u vlan=%u\n", port, value) < 0 ? -1 : 0;
         }
         if (n == 3 && strcmp(words[0], "mirror") == 0 &&
             parse_number(words[2], 1, admin->admission->count, &value) == 0) {
             if (!set_mirror(admin, port - 1, value - 1))
                 return reply(fd, "ERR use a different non-trunk port as the sniffer");
+            logger_event(admin->logger, 0, "admin set port %u to mirror to port %u", port, value);
             return dprintf(fd, "OK\nport %u mirrors to port %u\n", port, value) < 0 ? -1 : 0;
         }
     }
@@ -275,9 +329,10 @@ static int prepare_path(const AdminNames *names)
     return unlink(path);
 }
 
-int admin_start(Admin *admin, const AdminNames *names, Admission *admission, MacTable *mac)
+int admin_start(Admin *admin, const AdminNames *names, Admission *admission, MacTable *mac,
+                Logger *logger)
 {
-    *admin = (Admin){.names = *names, .admission = admission, .mac = mac, .client = -1};
+    *admin = (Admin){.names = *names, .admission = admission, .mac = mac, .logger = logger, .client = -1};
     for (unsigned i = 0; i < admission->count; i++) {
         if (admission->ports[i].mirror_to != NULL) {
             admin->mirror_source = &admission->ports[i];

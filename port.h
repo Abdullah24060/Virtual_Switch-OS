@@ -5,6 +5,7 @@
 #include "mac_table.h"
 #include "rate_timer.h"
 #include "stats.h"
+#include "logger.h"
 #include <stdint.h>
 
 typedef enum { PORT_FREE, PORT_ACTIVE, PORT_CLOSING } PortState;
@@ -36,6 +37,7 @@ typedef struct Port {
     RateTimer *rate_timer;
     pthread_rwlock_t *forwarding;
     SharedStats *stats;
+    Logger *logger;
     uint64_t send_interval_ns;
     uint64_t generation; /* A new connection never inherits an old MAC mapping. */
 } Port;

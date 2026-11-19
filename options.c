@@ -12,7 +12,8 @@ void print_switch_usage(void)
     fprintf(stderr, "usage: ./switch <tcp_port> <num_ports>"
                     " [mac_capacity macs_per_port age_seconds wait_seconds]"
                     " [--rate frames_per_second] [--vlan port vlan_id]..."
-                    " [--trunk port] [--mirror source_port sniffer_port]\n");
+                    " [--trunk port] [--mirror source_port sniffer_port]"
+                    " [--config path] [--log path] [--mac-dump path]\n");
 }
 
 static int invalid_option(void)
@@ -66,12 +67,23 @@ int parse_options(int argc, char *argv[], SwitchOptions *options)
                 options->mirror_source == options->sniffer)
                 return invalid_option();
         } else {
-            return invalid_option();
+            const char **path = strcmp(flag, "--config") == 0 ? &options->config_path :
+                                strcmp(flag, "--log") == 0 ? &options->log_path :
+                                strcmp(flag, "--mac-dump") == 0 ? &options->dump_path : NULL;
+            if (path == NULL || *path != NULL || i == argc || argv[i][0] == '\0' ||
+                strncmp(argv[i], "--", 2) == 0) return invalid_option();
+            *path = argv[i++];
         }
     }
     if ((options->trunk && options->vlans[options->trunk - 1] != 0) ||
         (options->sniffer && (options->sniffer == options->trunk ||
                              options->vlans[options->sniffer - 1] != 0)))
         return invalid_option();
+    if (options->log_path == NULL) options->log_path = "switch.log";
+    if (options->dump_path == NULL) options->dump_path = "mac_table.txt";
+    if (strcmp(options->log_path, options->dump_path) == 0 ||
+        (options->config_path != NULL &&
+         (strcmp(options->config_path, options->log_path) == 0 ||
+          strcmp(options->config_path, options->dump_path) == 0))) return invalid_option();
     return 0;
 }

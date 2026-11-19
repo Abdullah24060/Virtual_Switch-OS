@@ -1,7 +1,7 @@
 # Virtual Switch — Operating Systems Fall 2026
 
-A software network switch written in C for Linux. It supports Tier 1 switching,
-priority scheduling, rate limiting, VLANs, a trunk, mirroring and live administration.
+A software network switch written in C for Linux. It supports Tier 1 and Tier 2,
+including live administration, config reload, MAC dumps and timestamped logs.
 
 ## What works
 
@@ -25,9 +25,8 @@ priority scheduling, rate limiting, VLANs, a trunk, mirroring and live administr
   port, then receives `switch full` and disconnects if the timeout expires.
 - Clean Ctrl-C shutdown, with every thread joined and shared frame released.
 
-MAC moves and security events appear in the switch terminal. A trunk is
-designated at startup. Access VLANs and the mirror can also change while the
-switch is running.
+MAC moves and security events appear in the switch terminal and in
+`switch.log`. The trunk, access VLANs and mirror can change during a reload.
 
 ## Build and run
 
@@ -96,7 +95,7 @@ the switch on TCP port 9000 by default. For another instance, put
 
 | Command | Effect |
 | --- | --- |
-| `./swctl show ports` | Show each port's state, role, access VLAN and mirror target. A zero VLAN or mirror value means no access VLAN or no mirror. |
+| `./swctl show ports` | Show each port's state, role, access VLAN, mirror target and send rate. A zero VLAN or mirror value means no access VLAN or no mirror. |
 | `./swctl show mac` | List learned MAC addresses with their VLAN and port. |
 | `./swctl shutdown PORT` | Disconnect the host, discard queued frames and keep the slot disabled. |
 | `./swctl up PORT` | Enable the slot so a host can connect again. |
@@ -119,6 +118,49 @@ Structural MAC changes take the structure lock before bucket locks; eviction
 takes buckets in ascending order. Queue operations take the port lock before
 frame reference locks. Counter publication takes the shared stats mutex last.
 Socket writes and admin replies run outside those data locks.
+
+## Config file, signals and logs
+
+Start with `./switch 9000 3 --config switch.conf` to load a text config file.
+Here is a file for three ports:
+
+```text
+# An access VLAN for each port
+vlan 1 10
+vlan 2 10
+vlan 3 20
+rate 100
+```
+
+Use one directive per line. Blank lines and `#` comments are allowed.
+
+| Directive | Effect |
+| --- | --- |
+| `vlan PORT VLAN` | The VLAN a port uses in the access role. VLAN IDs are 1–4094. |
+| `trunk PORT` or `trunk off` | Select or remove the trunk. |
+| `mirror SOURCE SNIFFER` or `mirror off` | Select or remove a mirror. The sniffer must differ from the source and the trunk. |
+| `rate FPS` | Set the send rate per port. The range is 1–10000 frames per second. |
+
+The file overrides the startup defaults and command-line flags. If a
+directive repeats, the last value is used. A reload builds a new configuration
+from the original command line and the current file, so it can replace
+settings changed with `swctl`. Connections stay up and disabled ports stay
+disabled. A port whose VLAN or role changes discards its queued frames and
+forgets its learned MACs. The TCP port, port count and positional limits
+remain startup settings.
+
+- `kill -HUP PID` reloads the configured file. A missing or invalid file is
+  rejected and the running settings stay in place.
+- `kill -USR1 PID` writes a snapshot of learned MACs, VLANs and ports to
+  `mac_table.txt`, replacing any previous dump.
+- Ctrl+C (`SIGINT`) or `kill -TERM PID` shuts down the switch, joins its
+  threads and finishes writing queued log events.
+
+`--log PATH` and `--mac-dump PATH` override `switch.log` and `mac_table.txt`.
+The logger appends UTC timestamps to switch events such as connections, MAC
+moves, port security, admin changes and signals. Worker threads enqueue
+events. The logger thread writes them outside the queue lock. Under overload,
+the bounded queue drops excess events and the logger reports the count.
 
 ## Limits
 

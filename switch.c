@@ -4,6 +4,7 @@
 #include "admission.h"
 #include "admin.h"
 #include "options.h"
+#include "config.h"
 #include "sync.h"
 
 #include <arpa/inet.h>
@@ -22,15 +23,25 @@ typedef struct {
     sigset_t signals;
     int wake_fd;
     atomic_int stopping;
+    atomic_uint pending;
 } SignalContext;
 
-static void *wait_for_shutdown(void *argument)
+enum { RELOAD_CONFIG = 1, DUMP_MAC = 2 };
+
+static void *wait_for_signals(void *argument)
 {
     SignalContext *context = argument;
-    int signal_number;
-    check_thread(sigwait(&context->signals, &signal_number), "sigwait");
-    atomic_store(&context->stopping, 1);
-    notify_main(context->wake_fd, 'S');
+    for (;;) {
+        int signal_number;
+        check_thread(sigwait(&context->signals, &signal_number), "sigwait");
+        if (signal_number == SIGINT || signal_number == SIGTERM) {
+            atomic_store(&context->stopping, 1);
+            notify_main(context->wake_fd, 'S');
+            break;
+        }
+        atomic_fetch_or(&context->pending, signal_number == SIGHUP ? RELOAD_CONFIG : DUMP_MAC);
+        notify_main(context->wake_fd, 'C');
+    }
     return NULL;
 }
 
@@ -41,26 +52,44 @@ static int nonblocking(int fd)
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-static int read_events(int fd)
+static int drain_wake_pipe(int fd)
 {
     char events[128];
-    int stopping = 0;
     for (;;) {
         ssize_t n = read(fd, events, sizeof events);
         if (n == -1) {
             if (errno == EINTR) continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
             return -1;
         }
-        if (n == 0) break;
-        for (ssize_t i = 0; i < n; i++) {
-            if (events[i] == 'S') stopping = 1;
-        }
+        if (n == 0) return 0;
     }
-    return stopping;
 }
 
-static int run_switch(Admission *admission, int wake_fd, const atomic_int *stopping)
+static void reload_config(Admin *admin, const SwitchOptions *baseline, Logger *logger)
+{
+    if (baseline->config_path == NULL) {
+        logger_event(logger, 1, "config reload skipped: start with --config to enable reload");
+        return;
+    }
+    SwitchOptions config;
+    unsigned line;
+    if (config_load(baseline, &config, &line) == -1) {
+        if (line != 0)
+            logger_event(logger, 1, "config reload rejected: %s line %u", baseline->config_path, line);
+        else
+            logger_event(logger, 1, "config reload rejected: %s: %s",
+                         baseline->config_path, strerror(errno));
+        return;
+    }
+    admin_apply_config(admin, &config);
+    logger_event(logger, 1, "config reloaded from %s (send_rate=%u)",
+                 baseline->config_path, config.send_rate);
+    free(config.vlans);
+}
+
+static int run_switch(Admin *admin, int wake_fd, SignalContext *signals,
+                      const SwitchOptions *options, Logger *logger)
 {
     struct pollfd fd = { .fd = wake_fd, .events = POLLIN };
     for (;;) {
@@ -73,18 +102,28 @@ static int run_switch(Admission *admission, int wake_fd, const atomic_int *stopp
             fprintf(stderr, "notification pipe failed\n");
             return 1;
         }
-        if (read_events(wake_fd) == -1) {
+        if (drain_wake_pipe(wake_fd) == -1) {
             perror("read events");
             return 1;
         }
-        if (admission_reap(admission) == -1) return 1;
-        if (atomic_load(stopping)) return 0;
+        if (admission_reap(admin->admission) == -1) return 1;
+        if (atomic_load(&signals->stopping)) return 0;
+        unsigned pending = atomic_exchange(&signals->pending, 0);
+        if (pending & RELOAD_CONFIG) reload_config(admin, options, logger);
+        if (atomic_load(&signals->stopping)) return 0;
+        if (pending & DUMP_MAC) {
+            size_t count;
+            if (mac_dump_file(admin->mac, options->dump_path, &count) == -1)
+                logger_event(logger, 1, "MAC dump failed: %s: %s", options->dump_path, strerror(errno));
+            else
+                logger_event(logger, 1, "MAC table dumped to %s (%zu entries)", options->dump_path, count);
+        }
     }
 }
 
 int main(int argc, char *argv[])
 {
-    SwitchOptions options;
+    SwitchOptions options, initial;
     int listener = -1, wake[2] = {-1, -1};
     int reuse = 1, status = 1, signal_started = 0;
     unsigned initialized = 0;
@@ -94,6 +133,8 @@ int main(int argc, char *argv[])
     Admin admin;
     AdminNames names;
     SharedStats *stats = NULL;
+    Logger logger = {0};
+    int logger_started = 0;
     RateTimer rate_timer;
     int mac_ready = 0, admission_ready = 0, timer_started = 0, admin_started = 0;
     pthread_t signal_thread;
@@ -106,12 +147,22 @@ int main(int argc, char *argv[])
         free(options.vlans);
         return 1;
     }
+    unsigned line;
+    if (config_load(&options, &initial, &line) == -1) {
+        if (line != 0) fprintf(stderr, "invalid config %s line %u\n", options.config_path, line);
+        else perror("load switch config");
+        free(options.vlans);
+        return 1;
+    }
     unsigned tcp_port = options.tcp_port, num_ports = options.num_ports;
-    unsigned send_rate = options.send_rate;
+    unsigned send_rate = initial.send_rate;
     atomic_init(&signals.stopping, 0);
+    atomic_init(&signals.pending, 0);
     if (ignore_sigpipe() == -1 || sigemptyset(&signals.signals) == -1 ||
         sigaddset(&signals.signals, SIGINT) == -1 ||
-        sigaddset(&signals.signals, SIGTERM) == -1) {
+        sigaddset(&signals.signals, SIGTERM) == -1 ||
+        sigaddset(&signals.signals, SIGHUP) == -1 ||
+        sigaddset(&signals.signals, SIGUSR1) == -1) {
         perror("set up signals");
         goto cleanup;
     }
@@ -134,6 +185,11 @@ int main(int argc, char *argv[])
         perror("set up notification pipe");
         goto cleanup;
     }
+    if (logger_start(&logger, options.log_path) == -1) {
+        perror("start switch logger");
+        goto cleanup;
+    }
+    logger_started = 1;
     if (mac_table_init(&table, num_ports, options.capacity,
                        options.mac_limit, options.age_seconds) == -1) {
         perror("initialize MAC table");
@@ -156,15 +212,16 @@ int main(int argc, char *argv[])
         }
         ports[initialized].mac_table = &table;
         ports[initialized].stats = stats;
+        ports[initialized].logger = &logger;
         ports[initialized].rate_timer = &rate_timer;
         ports[initialized].send_interval_ns = (NS_PER_SECOND + send_rate - 1) / send_rate;
-        if (options.vlans[initialized] != 0)
-            ports[initialized].vlan = options.vlans[initialized];
-        ports[initialized].trunk = initialized + 1 == options.trunk;
-        ports[initialized].sniffer = initialized + 1 == options.sniffer;
+        if (initial.vlans[initialized] != 0)
+            ports[initialized].vlan = initial.vlans[initialized];
+        ports[initialized].trunk = initialized + 1 == initial.trunk;
+        ports[initialized].sniffer = initialized + 1 == initial.sniffer;
     }
-    if (options.mirror_source != 0)
-        ports[options.mirror_source - 1].mirror_to = &ports[options.sniffer - 1];
+    if (initial.mirror_source != 0)
+        ports[initial.mirror_source - 1].mirror_to = &ports[initial.sniffer - 1];
     if (admission_init(&admission, ports, num_ports, listener, wake[1], options.wait_seconds,
                        &signals.stopping) == -1) {
         perror("initialize admission");
@@ -181,13 +238,13 @@ int main(int argc, char *argv[])
     }
     timer_started = 1;
     signals.wake_fd = wake[1];
-    int error = pthread_create(&signal_thread, NULL, wait_for_shutdown, &signals);
+    int error = pthread_create(&signal_thread, NULL, wait_for_signals, &signals);
     if (error != 0) {
         fprintf(stderr, "create signal thread: %s\n", strerror(error));
         goto cleanup;
     }
     signal_started = 1;
-    if (admin_start(&admin, &names, &admission, &table) == -1) {
+    if (admin_start(&admin, &names, &admission, &table, &logger) == -1) {
         perror("start admin socket");
         goto cleanup;
     }
@@ -196,16 +253,17 @@ int main(int argc, char *argv[])
         perror("start admission thread");
         goto cleanup;
     }
-    if (printf("listening tcp_port=%u num_ports=%u queue_capacity_per_class=%d send_rate=%u\n",
-               tcp_port, num_ports, QUEUE_CAPACITY, send_rate) < 0 || fflush(stdout) == EOF) {
-        perror("print startup");
-        goto cleanup;
-    }
-    status = run_switch(&admission, wake[0], &signals.stopping);
+    logger_event(&logger, 1, "listening tcp_port=%u num_ports=%u queue_capacity_per_class=%d send_rate=%u",
+                 tcp_port, num_ports, QUEUE_CAPACITY, send_rate);
+    if (options.config_path != NULL)
+        logger_event(&logger, 0, "config loaded from %s", options.config_path);
+    status = run_switch(&admin, wake[0], &signals, &options, &logger);
 
 cleanup:
+    free(initial.vlans);
     free(options.vlans);
     atomic_store(&signals.stopping, 1);
+    if (logger_started) logger_event(&logger, 0, "switch shutting down");
     if (admin_started) admin_stop(&admin);
     /* Remove the name before another instance can acquire our TCP port. */
     if (stats != NULL && shm_unlink(names.stats) == -1) {
@@ -250,6 +308,10 @@ cleanup:
             perror("close notification pipe");
             status = 1;
         }
+    }
+    if (logger_started) {
+        logger_event(&logger, 0, "switch stopped");
+        if (logger_stop(&logger) == -1) status = 1;
     }
     return status;
 }
