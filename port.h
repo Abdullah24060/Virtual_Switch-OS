@@ -1,21 +1,21 @@
 #ifndef PORT_H
 #define PORT_H
 
-#include "shared_frame.h"
+#include "qos.h"
 #include "mac_table.h"
+#include "rate_timer.h"
 #include <stdint.h>
-
-#define QUEUE_CAPACITY 64
 
 typedef enum { PORT_FREE, PORT_ACTIVE, PORT_CLOSING } PortState;
 
 typedef struct Port {
-    /* The lock protects state, the queue and counters. */
+    /* The lock protects state, output queues, token bucket and counters. */
     pthread_mutex_t lock;
     pthread_cond_t not_empty;
     PortState state;
-    SharedFrame *queue[QUEUE_CAPACITY];
-    size_t head, count;
+    OutputQueues output;
+    int send_token;
+    uint64_t refill_at;
     uint64_t frames_in, frames_out, dropped;
 
     /* Main sets fd before starting workers, and closes it after joining them. */
@@ -28,6 +28,8 @@ typedef struct Port {
     unsigned num_ports;
     int wake_fd;
     MacTable *mac_table;
+    RateTimer *rate_timer;
+    uint64_t send_interval_ns;
     uint64_t generation; /* A new connection never inherits an old MAC mapping. */
 } Port;
 

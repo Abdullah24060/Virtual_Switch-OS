@@ -28,7 +28,7 @@ int port_init(Port *port, Port *all_ports, unsigned count, int wake_fd)
         errno = error;
         return -1;
     }
-    error = pthread_cond_init(&port->not_empty, NULL);
+    error = monotonic_cond_init(&port->not_empty);
     if (error != 0) {
         check_thread(pthread_mutex_destroy(&port->lock), "destroy port lock");
         errno = error;
@@ -73,15 +73,10 @@ static int enqueue_generation(Port *port, SharedFrame *frame, uint64_t generatio
     int added = -1;
     check_thread(pthread_mutex_lock(&port->lock), "lock port");
     if (port->state == PORT_ACTIVE && (generation == 0 || port->generation == generation)) {
-        added = 0;
-        if (port->count == QUEUE_CAPACITY) {
-            port->dropped++;
-        } else {
-            /* Acquire ownership BEFORE the sender can see this pointer. */
-            shared_frame_retain(frame);
-            port->queue[(port->head + port->count) % QUEUE_CAPACITY] = frame;
-            port->count++;
-            added = 1;
+        int empty = port->output.count == 0;
+        added = output_enqueue(&port->output, frame, monotonic_ns());
+        if (!added) port->dropped++;
+        else if (empty) {
             check_thread(pthread_cond_signal(&port->not_empty), "signal sender");
         }
     }
@@ -167,30 +162,57 @@ static void *receive_frames(void *argument)
     return NULL;
 }
 
+/* Both waits release the port mutex. Only the timer grants a spent token. */
+static void wait_to_send(Port *port)
+{
+    while (port->state == PORT_ACTIVE) {
+        if (port->output.count == 0) {
+            check_thread(pthread_cond_wait(&port->not_empty, &port->lock), "wait for frame");
+        } else if (!port->send_token) {
+            struct timespec deadline = monotonic_deadline(port->refill_at);
+            int error = pthread_cond_timedwait(&port->not_empty, &port->lock, &deadline);
+            if (error == ETIMEDOUT) {
+                /* The timer can run just after this deadline. Wait for its
+                   notification instead of retrying an expired timed wait. */
+                while (!port->send_token && port->state == PORT_ACTIVE)
+                    check_thread(pthread_cond_wait(&port->not_empty, &port->lock), "wait for refill");
+            } else {
+                check_thread(error, "wait for send token");
+            }
+        } else {
+            break;
+        }
+    }
+}
+
 static void *send_frames(void *argument)
 {
     Port *port = argument;
     for (;;) {
         check_thread(pthread_mutex_lock(&port->lock), "lock port");
-        while (port->count == 0 && port->state == PORT_ACTIVE) {
-            check_thread(pthread_cond_wait(&port->not_empty, &port->lock), "wait for frame");
-        }
+        wait_to_send(port);
         if (port->state != PORT_ACTIVE) {
             check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
             break;
         }
-        SharedFrame *shared = port->queue[port->head];
-        port->head = (port->head + 1) % QUEUE_CAPACITY;
-        port->count--;
+        SharedFrame *shared = output_take(&port->output, monotonic_ns());
+        port->send_token = 0;
+        port->refill_at = 0; /* Arm the refill after the write completes. */
         check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
 
         /* Never hold a port or frame lock during a socket write. */
         int result = frame_write(port->fd, &shared->frame);
         shared_frame_release(shared);
         check_thread(pthread_mutex_lock(&port->lock), "lock port");
-        if (result == 0) port->frames_out++;
-        else port->dropped++;
+        int refill = result == 0 && port->state == PORT_ACTIVE;
+        if (result == 0) {
+            port->frames_out++;
+            if (refill) port->refill_at = monotonic_ns() + port->send_interval_ns;
+        } else {
+            port->dropped++;
+        }
         check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
+        if (refill) rate_timer_notify(port->rate_timer);
         if (result == -1) {
             port_stop(port);
             break;
@@ -203,7 +225,8 @@ int port_start(Port *port, int fd)
 {
     check_thread(pthread_mutex_lock(&port->lock), "lock port");
     port->fd = fd;
-    port->head = port->count = 0;
+    port->send_token = 1; /* One frame can leave immediately; idle credits cannot build up. */
+    port->refill_at = 0;
     port->frames_in = port->frames_out = port->dropped = 0;
     port->state = PORT_ACTIVE;
     port->generation++;
@@ -230,7 +253,7 @@ int port_reap(Port *port, unsigned number)
     check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
     if (!closing) return 0;
 
-    /* Main is the only reaper; joins happen without holding any lock. */
+    /* Main is the only reaper. Join without holding this port's lock. */
     if (port->receiver_started) {
         check_thread(pthread_join(port->receiver, NULL), "join receiver");
         port->receiver_started = 0;
@@ -247,12 +270,7 @@ int port_reap(Port *port, unsigned number)
         result = -1;
     }
     check_thread(pthread_mutex_lock(&port->lock), "lock port");
-    while (port->count != 0) {
-        shared_frame_release(port->queue[port->head]);
-        port->head = (port->head + 1) % QUEUE_CAPACITY;
-        port->count--;
-        port->dropped++;
-    }
+    port->dropped += output_discard(&port->output);
     uint64_t in = port->frames_in, out = port->frames_out, dropped = port->dropped;
     port->fd = -1;
     port->state = PORT_FREE;

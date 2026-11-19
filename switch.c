@@ -83,24 +83,30 @@ int main(int argc, char *argv[])
 {
     unsigned tcp_port, num_ports;
     unsigned capacity = 1024, mac_limit = 8, age_seconds = 60, wait_seconds = 5;
+    unsigned send_rate = DEFAULT_SEND_RATE;
     int listener = -1, wake[2] = {-1, -1};
     int reuse = 1, status = 1, signal_started = 0;
     unsigned initialized = 0;
     Port *ports = NULL;
     MacTable table;
     Admission admission;
-    int mac_ready = 0, admission_ready = 0;
+    RateTimer rate_timer;
+    int mac_ready = 0, admission_ready = 0, timer_started = 0;
     pthread_t signal_thread;
     SignalContext signals;
     struct sockaddr_in address = {0};
 
-    if ((argc != 3 && argc != 7) || parse_number(argv[1], 1, 65535, &tcp_port) == -1 ||
+    int has_rate = argc >= 5 && strcmp(argv[argc - 2], "--rate") == 0;
+    int base_argc = argc - (has_rate ? 2 : 0);
+    if ((base_argc != 3 && base_argc != 7) || parse_number(argv[1], 1, 65535, &tcp_port) == -1 ||
         parse_number(argv[2], 1, 65535, &num_ports) == -1 ||
-        (argc == 7 && (parse_number(argv[3], 1, 1000000, &capacity) == -1 ||
+        (base_argc == 7 && (parse_number(argv[3], 1, 1000000, &capacity) == -1 ||
                        parse_number(argv[4], 1, 65535, &mac_limit) == -1 ||
                        parse_number(argv[5], 1, 86400, &age_seconds) == -1 ||
-                       parse_number(argv[6], 1, 3600, &wait_seconds) == -1))) {
-        fprintf(stderr, "usage: ./switch <tcp_port> <num_ports> [mac_capacity macs_per_port age_seconds wait_seconds]\n");
+                       parse_number(argv[6], 1, 3600, &wait_seconds) == -1)) ||
+        (has_rate && parse_number(argv[argc - 1], 1, MAX_SEND_RATE, &send_rate) == -1)) {
+        fprintf(stderr, "usage: ./switch <tcp_port> <num_ports>"
+                        " [mac_capacity macs_per_port age_seconds wait_seconds] [--rate frames_per_second]\n");
         return 1;
     }
     atomic_init(&signals.stopping, 0);
@@ -145,6 +151,8 @@ int main(int argc, char *argv[])
             goto cleanup;
         }
         ports[initialized].mac_table = &table;
+        ports[initialized].rate_timer = &rate_timer;
+        ports[initialized].send_interval_ns = (NS_PER_SECOND + send_rate - 1) / send_rate;
     }
     if (admission_init(&admission, ports, num_ports, listener, wake[1], wait_seconds,
                        &signals.stopping) == -1) {
@@ -156,6 +164,11 @@ int main(int argc, char *argv[])
         perror("start aging thread");
         goto cleanup;
     }
+    if (rate_timer_start(&rate_timer, ports, num_ports) == -1) {
+        perror("start rate timer");
+        goto cleanup;
+    }
+    timer_started = 1;
     signals.wake_fd = wake[1];
     int error = pthread_create(&signal_thread, NULL, wait_for_shutdown, &signals);
     if (error != 0) {
@@ -167,8 +180,8 @@ int main(int argc, char *argv[])
         perror("start admission thread");
         goto cleanup;
     }
-    if (printf("listening tcp_port=%u num_ports=%u queue_capacity=%d\n",
-               tcp_port, num_ports, QUEUE_CAPACITY) < 0 || fflush(stdout) == EOF) {
+    if (printf("listening tcp_port=%u num_ports=%u queue_capacity_per_class=%d send_rate=%u\n",
+               tcp_port, num_ports, QUEUE_CAPACITY, send_rate) < 0 || fflush(stdout) == EOF) {
         perror("print startup");
         goto cleanup;
     }
@@ -193,7 +206,8 @@ cleanup:
             if (port_reap(&ports[i], i + 1) == -1) status = 1;
         }
     }
-    /* Receivers can inspect every port: join ALL before destroying ANY lock. */
+    if (timer_started) rate_timer_stop(&rate_timer);
+    /* Receivers and the timer can inspect every port. Join them before destroying locks. */
     for (unsigned i = 0; i < initialized; i++) port_destroy(&ports[i]);
     free(ports);
     if (admission_ready) admission_destroy(&admission);

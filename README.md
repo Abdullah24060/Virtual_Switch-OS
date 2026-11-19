@@ -1,13 +1,20 @@
 # Virtual Switch — Operating Systems Fall 2026
 
-A software network switch written in C for Linux. Day 1's three parts are complete.
+A software network switch written in C for Linux. Tier 1, priority scheduling
+and rate limiting are implemented.
 
 ## What works
 
 - The manual's 17-byte frame header and payloads up to 1500 bytes, including
   partial reads/writes and hosts disconnecting in the middle of a frame.
-- A receiver, sender and bounded 64-frame output queue for each connected host.
-  Full queues drop and count frames. Broadcast queues share one frame by pointer.
+- A receiver and sender for each connected host, with separate high, normal and
+  low output queues. Each queue holds 64 frames. Full queues count and drop new
+  arrivals. Broadcast queues share one frame by pointer.
+- Weighted round robin gives backlogged priority classes a 5:3:1 share. The
+  oldest queue head takes precedence once it has waited 200 ms. Frames stay in
+  arrival order within their class.
+- A timer refills a one-token bucket for each port. A port can send immediately
+  after connecting or sitting idle, then waits for a token between frames.
 - MAC learning with 32 bucket locks, aging, exact LRU eviction and MAC moves.
   Known destinations receive unicast; unknown destinations and broadcasts flood
   every other port. Frames addressed back to their incoming port are filtered.
@@ -17,9 +24,9 @@ A software network switch written in C for Linux. Day 1's three parts are comple
   port, then receives `switch full` and disconnects if the timeout expires.
 - Clean Ctrl-C shutdown, with every thread joined and shared frame released.
 
-MAC moves and security events appear in the switch terminal. The queued file
-logger, VLAN isolation, QoS and administration tool come in Tier 2. VLAN and
-priority fields are already carried correctly. There is no config file yet.
+MAC moves and security events appear in the switch terminal. VLAN IDs are
+carried in frames. VLAN isolation, administration and file logging are planned
+for the remaining Tier 2 parts.
 
 ## Build and run
 
@@ -74,3 +81,7 @@ For example, this allows two hosts and uses shorter limits for a demonstration:
 
 Capacity accepts 1–1000000, MACs per port 1–65535, age 1–86400 seconds and wait
 1–3600 seconds. TCP port and number of switch ports accept 1–65535.
+
+The default send limit is **1,000 frames per second per port**. Add
+`--rate <frames_per_second>` as the last two arguments to set the initial rate
+for all ports. Each port has its own token bucket.
