@@ -1,7 +1,7 @@
 # Virtual Switch — Operating Systems Fall 2026
 
 A software network switch written in C for Linux. It supports Tier 1 switching,
-priority scheduling, rate limiting, VLANs, a trunk and port mirroring.
+priority scheduling, rate limiting, VLANs, a trunk, mirroring and live administration.
 
 ## What works
 
@@ -25,9 +25,9 @@ priority scheduling, rate limiting, VLANs, a trunk and port mirroring.
   port, then receives `switch full` and disconnects if the timeout expires.
 - Clean Ctrl-C shutdown, with every thread joined and shared frame released.
 
-MAC moves and security events appear in the switch terminal. VLAN, trunk and
-mirror settings are set at startup. Live administration and file logging are
-planned for the remaining Tier 2 parts.
+MAC moves and security events appear in the switch terminal. A trunk is
+designated at startup. Access VLANs and the mirror can also change while the
+switch is running.
 
 ## Build and run
 
@@ -87,6 +87,38 @@ input is discarded. It receives mirror copies with the original VLAN and
 priority. Copies use the sniffer's bounded queues and rate limit. A full
 sniffer queue drops the mirror copy while ordinary forwarding continues.
 The source port's `mirrored` counter counts copies queued successfully.
+
+## Live administration
+
+`swctl` uses a UNIX socket in a private directory for your user. It selects
+the switch on TCP port 9000 by default. For another instance, put
+`--port TCP_PORT` before the command.
+
+| Command | Effect |
+| --- | --- |
+| `./swctl show ports` | Show each port's state, role, access VLAN and mirror target. A zero VLAN or mirror value means no access VLAN or no mirror. |
+| `./swctl show mac` | List learned MAC addresses with their VLAN and port. |
+| `./swctl shutdown PORT` | Disconnect the host, discard queued frames and keep the slot disabled. |
+| `./swctl up PORT` | Enable the slot so a host can connect again. |
+| `./swctl vlan PORT VLAN` | Change an access port's VLAN on the existing connection. Drop old queued frames and forget that connection's learned MACs. |
+| `./swctl mirror SOURCE SNIFFER` | Replace the mirror rule. The previous sniffer becomes a normal port again if the target changes. |
+| `./swctl clear mac` | Empty the MAC table. Subsequent frames learn addresses again. |
+| `./swctl stats` | Read the latest per-port counters from POSIX shared memory. |
+| `./swctl stats --watch` | Refresh once per second. Press Ctrl+C to stop watching. |
+
+The counters reset when a fresh host connects to a port. A VLAN or mirror
+change discards affected queued frames. A write already in progress can
+finish on its current connection.
+
+Forwarding takes the read side of a shared lock, so receivers can still
+operate concurrently. VLAN, mirror and MAC clear commands take the write
+side. The forwarding lock comes before individual port locks or the MAC
+structure lock. The admission table lock comes before a port lock during
+start, shutdown and cleanup. Joins hold only the admission table lock.
+Structural MAC changes take the structure lock before bucket locks; eviction
+takes buckets in ascending order. Queue operations take the port lock before
+frame reference locks. Counter publication takes the shared stats mutex last.
+Socket writes and admin replies run outside those data locks.
 
 ## Limits
 

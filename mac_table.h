@@ -41,6 +41,12 @@ typedef struct {
     uint64_t generation;
 } MacLocation;
 
+typedef struct {
+    uint8_t mac[MAC_SIZE];
+    uint16_t vlan;
+    unsigned port;
+} MacRecord;
+
 enum { MAC_ERROR = -1, MAC_OK, MAC_MOVED, MAC_LIMIT };
 
 int mac_table_init(MacTable *table, unsigned ports, size_t capacity,
@@ -54,5 +60,7 @@ int mac_lookup(MacTable *table, const uint8_t mac[MAC_SIZE], uint16_t vlan,
                MacLocation *location);
 void mac_forget_port(MacTable *table, unsigned port, uint64_t generation);
 void mac_age(MacTable *table);
+void mac_clear(MacTable *table);
+int mac_snapshot(MacTable *table, MacRecord **records, size_t *count);
 
 #endif

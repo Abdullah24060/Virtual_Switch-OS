@@ -35,6 +35,7 @@ int port_init(Port *port, Port *all_ports, unsigned count, int wake_fd)
         return -1;
     }
     port->state = PORT_FREE;
+    port->enabled = 1;
     port->vlan = 1;
     port->fd = -1;
     port->all_ports = all_ports;
@@ -46,7 +47,7 @@ int port_init(Port *port, Port *all_ports, unsigned count, int wake_fd)
 int port_is_free(Port *port)
 {
     check_thread(pthread_mutex_lock(&port->lock), "lock port");
-    int available = port->state == PORT_FREE;
+    int available = port->enabled && port->state == PORT_FREE;
     check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
     return available;
 }
@@ -79,11 +80,15 @@ static int enqueue_frame(Port *port, SharedFrame *frame, uint64_t generation, in
 {
     int added = -1;
     check_thread(pthread_mutex_lock(&port->lock), "lock port");
-    if (port->state == PORT_ACTIVE && (generation == 0 || port->generation == generation) &&
+    if (port->enabled && port->state == PORT_ACTIVE &&
+        (generation == 0 || port->generation == generation) &&
         (mirror ? port->sniffer : carries_vlan(port, frame->frame.vlan))) {
         int empty = port->output.count == 0;
         added = output_enqueue(&port->output, frame, monotonic_ns());
-        if (!added) port->dropped++;
+        if (!added) {
+            port->dropped++;
+            port_publish_stats(port);
+        }
         else if (empty) {
             check_thread(pthread_cond_signal(&port->not_empty), "signal sender");
         }
@@ -103,6 +108,7 @@ static void mirror_frame(Port *source, Port *sniffer, SharedFrame *frame)
     if (sniffer != NULL && enqueue_frame(sniffer, frame, 0, 1) == 1) {
         check_thread(pthread_mutex_lock(&source->lock), "lock mirrored port");
         source->mirrored++;
+        port_publish_stats(source);
         check_thread(pthread_mutex_unlock(&source->lock), "unlock mirrored port");
     }
 }
@@ -115,36 +121,71 @@ static int broadcast(const uint8_t mac[MAC_SIZE])
     return 1;
 }
 
+enum { FORWARD_STOP = -2 };
+
+/* The forwarding read lock keeps these decisions in one configuration. */
+static int forward_frame(Port *port, const Frame *frame, unsigned index, unsigned *old_port)
+{
+    check_thread(pthread_mutex_lock(&port->lock), "lock port");
+    int active = port->enabled && port->state == PORT_ACTIVE;
+    int allowed = carries_vlan(port, frame->vlan);
+    Port *sniffer = port->mirror_to;
+    if (active) {
+        port->frames_in++;
+        if (!allowed) port->dropped++;
+        port_publish_stats(port);
+    }
+    check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
+    if (!active) return FORWARD_STOP;
+    if (!allowed) return MAC_OK;
+
+    int learned = mac_learn(port->mac_table, frame->src, frame->vlan, index,
+                            port->generation, old_port);
+    if (learned == MAC_ERROR) return MAC_ERROR;
+    if (learned == MAC_LIMIT) {
+        check_thread(pthread_mutex_lock(&port->lock), "lock port");
+        port->dropped++;
+        port_publish_stats(port);
+        check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
+        return MAC_LIMIT;
+    }
+    SharedFrame *shared = shared_frame_create(frame);
+    if (shared == NULL) return MAC_ERROR;
+    mirror_frame(port, sniffer, shared);
+    MacLocation destination;
+    int flood = broadcast(frame->dst) ||
+                !mac_lookup(port->mac_table, frame->dst, frame->vlan, &destination);
+    if (!flood && destination.port != index) {
+        flood = enqueue_frame(&port->all_ports[destination.port], shared,
+                              destination.generation, 0) == -1;
+    }
+    if (flood) {
+        for (unsigned i = 0; i < port->num_ports; i++) {
+            if (i != index) port_enqueue(&port->all_ports[i], shared);
+        }
+    }
+    shared_frame_release(shared);
+    return learned;
+}
+
 static void *receive_frames(void *argument)
 {
     Port *port = argument;
+    unsigned index = (unsigned)(port - port->all_ports);
     Frame frame;
     int result;
 
     while ((result = frame_read(port->fd, &frame)) == 1) {
-        check_thread(pthread_mutex_lock(&port->lock), "lock port");
-        int active = port->state == PORT_ACTIVE;
-        int allowed = carries_vlan(port, frame.vlan);
-        Port *sniffer = port->mirror_to;
-        if (active) {
-            port->frames_in++;
-            if (!allowed) port->dropped++;
-        }
-        check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
-        if (!active) break;
-        if (!allowed) continue;
-
-        unsigned index = (unsigned)(port - port->all_ports), old_port = 0;
-        int learned = mac_learn(port->mac_table, frame.src, frame.vlan, index,
-                                port->generation, &old_port);
+        unsigned old_port = 0;
+        check_thread(pthread_rwlock_rdlock(port->forwarding), "lock forwarding");
+        int learned = forward_frame(port, &frame, index, &old_port);
+        check_thread(pthread_rwlock_unlock(port->forwarding), "unlock forwarding");
+        if (learned == FORWARD_STOP) break;
         if (learned == MAC_ERROR) {
-            perror("learn MAC");
+            perror("process frame");
             break;
         }
         if (learned == MAC_LIMIT) {
-            check_thread(pthread_mutex_lock(&port->lock), "lock port");
-            port->dropped++;
-            check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
             if (printf("port security: port %u exceeded MAC limit\n", index + 1) < 0 ||
                 fflush(stdout) == EOF) perror("print port security");
             break; /* Stop this port; the violating frame is never forwarded. */
@@ -159,26 +200,6 @@ static void *receive_frames(void *argument)
                 break;
             }
         }
-        SharedFrame *shared = shared_frame_create(&frame);
-        if (shared == NULL) {
-            perror("allocate shared frame");
-            break;
-        }
-        mirror_frame(port, sniffer, shared);
-        MacLocation destination;
-        int flood = broadcast(frame.dst) ||
-                    !mac_lookup(port->mac_table, frame.dst, frame.vlan, &destination);
-        if (!flood && destination.port != index) {
-            /* A full known-destination queue drops, rather than flooding. */
-            flood = enqueue_frame(&port->all_ports[destination.port], shared,
-                                  destination.generation, 0) == -1;
-        }
-        if (flood) {
-            for (unsigned i = 0; i < port->num_ports; i++) {
-                if (i != index) port_enqueue(&port->all_ports[i], shared);
-            }
-        }
-        shared_frame_release(shared); /* Release the receiver's ownership. */
     }
     if (result == -1) {
         check_thread(pthread_mutex_lock(&port->lock), "lock port");
@@ -232,15 +253,22 @@ static void *send_frames(void *argument)
         int result = frame_write(port->fd, &shared->frame);
         check_thread(pthread_mutex_lock(&port->lock), "lock port");
         int refill = result == 0 && port->state == PORT_ACTIVE;
-        Port *sniffer = result == 0 ? port->mirror_to : NULL;
         if (result == 0) {
             port->frames_out++;
             if (refill) port->refill_at = monotonic_ns() + port->send_interval_ns;
         } else {
             port->dropped++;
         }
+        port_publish_stats(port);
         check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
-        mirror_frame(port, sniffer, shared);
+        if (result == 0) {
+            check_thread(pthread_rwlock_rdlock(port->forwarding), "lock forwarding");
+            check_thread(pthread_mutex_lock(&port->lock), "lock port");
+            Port *sniffer = carries_vlan(port, shared->frame.vlan) ? port->mirror_to : NULL;
+            check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
+            mirror_frame(port, sniffer, shared);
+            check_thread(pthread_rwlock_unlock(port->forwarding), "unlock forwarding");
+        }
         shared_frame_release(shared);
         if (refill) rate_timer_notify(port->rate_timer);
         if (result == -1) {
@@ -260,6 +288,7 @@ int port_start(Port *port, int fd)
     port->frames_in = port->frames_out = port->dropped = port->mirrored = 0;
     port->state = PORT_ACTIVE;
     port->generation++;
+    port_publish_stats(port);
     check_thread(pthread_mutex_unlock(&port->lock), "unlock port");
 
     int error = pthread_create(&port->sender, NULL, send_frames, port);
@@ -300,7 +329,7 @@ int port_reap(Port *port, unsigned number)
         result = -1;
     }
     check_thread(pthread_mutex_lock(&port->lock), "lock port");
-    port->dropped += output_discard(&port->output);
+    port_discard_output(port);
     uint64_t in = port->frames_in, out = port->frames_out, dropped = port->dropped;
     uint64_t mirrored = port->mirrored;
     port->fd = -1;
@@ -319,4 +348,17 @@ void port_destroy(Port *port)
 {
     check_thread(pthread_cond_destroy(&port->not_empty), "destroy port condition");
     check_thread(pthread_mutex_destroy(&port->lock), "destroy port lock");
+}
+
+void port_publish_stats(Port *port)
+{
+    if (port->stats == NULL) return;
+    stats_update(port->stats, (unsigned)(port - port->all_ports),
+                 (PortCounters){port->frames_in, port->frames_out, port->dropped, port->mirrored});
+}
+
+void port_discard_output(Port *port)
+{
+    port->dropped += output_discard(&port->output);
+    port_publish_stats(port);
 }

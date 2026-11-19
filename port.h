@@ -4,6 +4,7 @@
 #include "qos.h"
 #include "mac_table.h"
 #include "rate_timer.h"
+#include "stats.h"
 #include <stdint.h>
 
 typedef enum { PORT_FREE, PORT_ACTIVE, PORT_CLOSING } PortState;
@@ -13,6 +14,7 @@ typedef struct Port {
     pthread_mutex_t lock;
     pthread_cond_t not_empty;
     PortState state;
+    int enabled;
     OutputQueues output;
     int send_token;
     uint64_t refill_at;
@@ -32,6 +34,8 @@ typedef struct Port {
     int wake_fd;
     MacTable *mac_table;
     RateTimer *rate_timer;
+    pthread_rwlock_t *forwarding;
+    SharedStats *stats;
     uint64_t send_interval_ns;
     uint64_t generation; /* A new connection never inherits an old MAC mapping. */
 } Port;
@@ -46,5 +50,8 @@ int port_is_free(Port *port);
 /* Neither enqueue nor notification waits for buffer space. */
 int port_enqueue(Port *port, SharedFrame *frame);
 void notify_main(int fd, char event);
+/* Caller holds this port's lock. */
+void port_publish_stats(Port *port);
+void port_discard_output(Port *port);
 
 #endif

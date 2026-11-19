@@ -2,6 +2,7 @@
 #include "frame.h"
 #include "port.h"
 #include "admission.h"
+#include "admin.h"
 #include "options.h"
 #include "sync.h"
 
@@ -13,6 +14,7 @@
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -89,8 +91,11 @@ int main(int argc, char *argv[])
     Port *ports = NULL;
     MacTable table;
     Admission admission;
+    Admin admin;
+    AdminNames names;
+    SharedStats *stats = NULL;
     RateTimer rate_timer;
-    int mac_ready = 0, admission_ready = 0, timer_started = 0;
+    int mac_ready = 0, admission_ready = 0, timer_started = 0, admin_started = 0;
     pthread_t signal_thread;
     SignalContext signals;
     struct sockaddr_in address = {0};
@@ -135,6 +140,10 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
     mac_ready = 1;
+    if (admin_names(&names, tcp_port) == -1 || stats_create(names.stats, num_ports, &stats) == -1) {
+        perror("initialize shared stats");
+        goto cleanup;
+    }
     ports = calloc(num_ports, sizeof *ports);
     if (ports == NULL) {
         perror("allocate ports");
@@ -146,6 +155,7 @@ int main(int argc, char *argv[])
             goto cleanup;
         }
         ports[initialized].mac_table = &table;
+        ports[initialized].stats = stats;
         ports[initialized].rate_timer = &rate_timer;
         ports[initialized].send_interval_ns = (NS_PER_SECOND + send_rate - 1) / send_rate;
         if (options.vlans[initialized] != 0)
@@ -177,6 +187,11 @@ int main(int argc, char *argv[])
         goto cleanup;
     }
     signal_started = 1;
+    if (admin_start(&admin, &names, &admission, &table) == -1) {
+        perror("start admin socket");
+        goto cleanup;
+    }
+    admin_started = 1;
     if (admission_start(&admission) == -1) {
         perror("start admission thread");
         goto cleanup;
@@ -191,6 +206,12 @@ int main(int argc, char *argv[])
 cleanup:
     free(options.vlans);
     atomic_store(&signals.stopping, 1);
+    if (admin_started) admin_stop(&admin);
+    /* Remove the name before another instance can acquire our TCP port. */
+    if (stats != NULL && shm_unlink(names.stats) == -1) {
+        perror("remove shared stats name");
+        status = 1;
+    }
     if (admission_ready) {
         admission_stop(&admission);
         if (admission.status != 0) status = 1;
@@ -214,6 +235,10 @@ cleanup:
     free(ports);
     if (admission_ready) admission_destroy(&admission);
     if (mac_ready) mac_table_destroy(&table);
+    if (stats != NULL && stats_stop(stats) == -1) {
+        perror("stop shared stats");
+        status = 1;
+    }
     if (signal_started) {
         /* Also wake sigwait if shutdown followed an error instead of a signal. */
         int error = pthread_kill(signal_thread, SIGTERM);

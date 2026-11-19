@@ -194,6 +194,53 @@ void mac_forget_port(MacTable *table, unsigned port, uint64_t generation)
     check_thread(pthread_mutex_unlock(&table->changes), "unlock MAC changes");
 }
 
+void mac_clear(MacTable *table)
+{
+    check_thread(pthread_mutex_lock(&table->changes), "lock MAC changes");
+    for (unsigned i = 0; i < MAC_BUCKETS; i++) {
+        MacBucket *bucket = &table->buckets[i];
+        check_thread(pthread_mutex_lock(&bucket->lock), "lock MAC bucket");
+        while (bucket->head != NULL) {
+            MacEntry *entry = bucket->head;
+            bucket->head = entry->next;
+            free(entry);
+        }
+        check_thread(pthread_mutex_unlock(&bucket->lock), "unlock MAC bucket");
+    }
+    table->count = 0;
+    memset(table->per_port, 0, table->num_ports * sizeof(*table->per_port));
+    check_thread(pthread_mutex_unlock(&table->changes), "unlock MAC changes");
+}
+
+int mac_snapshot(MacTable *table, MacRecord **records, size_t *count)
+{
+    *records = NULL;
+    *count = 0;
+    check_thread(pthread_mutex_lock(&table->changes), "lock MAC changes");
+    if (table->count != 0) {
+        *records = malloc(table->count * sizeof(**records));
+        if (*records == NULL) {
+            check_thread(pthread_mutex_unlock(&table->changes), "unlock MAC changes");
+            return -1;
+        }
+    }
+    struct timespec sampled_at = now();
+    for (unsigned i = 0; i < MAC_BUCKETS; i++) {
+        MacBucket *bucket = &table->buckets[i];
+        check_thread(pthread_mutex_lock(&bucket->lock), "lock MAC bucket");
+        for (MacEntry *entry = bucket->head; entry != NULL; entry = entry->next) {
+            if (expired(table, entry, sampled_at)) continue;
+            MacRecord *record = &(*records)[(*count)++];
+            memcpy(record->mac, entry->mac, MAC_SIZE);
+            record->vlan = entry->vlan;
+            record->port = entry->port;
+        }
+        check_thread(pthread_mutex_unlock(&bucket->lock), "unlock MAC bucket");
+    }
+    check_thread(pthread_mutex_unlock(&table->changes), "unlock MAC changes");
+    return 0;
+}
+
 static void *age_entries(void *argument)
 {
     MacTable *table = argument;
