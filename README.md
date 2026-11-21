@@ -1,189 +1,178 @@
-# Virtual Switch — Operating Systems Fall 2026
+# Virtual Switch — Operating Systems
 
-A software network switch written in C for Linux. It supports Tier 1 and Tier 2,
-including live administration, config reload, MAC dumps and timestamped logs.
+A Linux switch written in C. The project builds three programs: `switch` runs the server, `host` sends and receives frames, and `swctl` controls the running switch.
 
-## What works
+## 1. Build and start the switch
 
-- The manual's 17-byte frame header and payloads up to 1500 bytes, including
-  partial reads/writes and hosts disconnecting in the middle of a frame.
-- A receiver and sender for each connected host, with separate high, normal and
-  low output queues. Each queue holds 64 frames. Full queues count and drop new
-  arrivals. Broadcast queues share one frame by pointer.
-- Weighted round robin gives backlogged priority classes a 5:3:1 share. The
-  oldest queue head takes precedence once it has waited 200 ms. Frames stay in
-  arrival order within their class.
-- A timer refills a one-token bucket for each port. A port can send immediately
-  after connecting or sitting idle, then waits for a token between frames.
-- VLAN-aware MAC learning with 32 bucket locks, aging, exact LRU eviction and
-  MAC moves. Known destinations receive unicast. Unknown destinations and
-  broadcasts flood within the frame's VLAN and to the trunk. Frames addressed
-  back to their incoming port are filtered.
-- Per-port MAC limits: exceeding the limit shuts down that port. Its resources
-  and learned entries are cleaned up before another connection can reuse it.
-- A counting semaphore limits connected hosts. An extra host waits for a free
-  port, then receives `switch full` and disconnects if the timeout expires.
-- Clean Ctrl-C shutdown, with every thread joined and shared frame released.
-
-MAC moves and security events appear in the switch terminal and in
-`switch.log`. The trunk, access VLANs and mirror can change during a reload.
-
-## Build and run
-
-Requires GCC and Make. The build uses
-`-std=c11 -Wall -Wextra -Werror -g -O0` and `-pthread`.
+Open four terminals in the project folder. On Linux Mint, run these commands in **Terminal 1** with GCC and Make installed:
 
 ```bash
 make
-./switch 9000 8
+./switch 9000 3
 ```
 
-Start each host in its own terminal, with a different source MAC:
+`9000` is the TCP port the hosts connect to. `3` is the number of host connections available. Wait for `listening`. With these defaults, all hosts use VLAN 1.
+
+## 2. Connect two hosts and send a message
+
+**Terminal 2 — Host A.** Start this one first so it gets switch port 1.
 
 ```bash
 ./host 127.0.0.1 9000 02:00:00:00:00:0a
+```
+
+**Terminal 3 — Host B.** Start this one next so it gets switch port 2.
+
+```bash
 ./host 127.0.0.1 9000 02:00:00:00:00:0b
 ```
 
-Arguments are `./switch <tcp_port> <num_ports>` and
-`./host <switch_ip> <tcp_port> <mac>`. Use a numeric IPv4 address.
-Type `<destination_mac> <vlan> <priority> [payload]` in a host:
+**In Host A**, type this line and press Enter. Host B should display `payload=hello everyone`.
 
 ```text
 ff:ff:ff:ff:ff:ff 1 1 hello everyone
-02:00:00:00:00:0b 1 1 hello B
 ```
 
-A host must send a frame before the switch can learn its MAC. The source MAC
-comes from the host argument and the payload length is calculated automatically.
-VLANs are 1–4094 and priorities are 0 (high), 1 (normal), or 2 (low). The host
-shows printable ASCII as text (`payload=hello B`) and other bytes as hex
-(`payload_hex=00ff`). Ctrl-D on empty input disconnects the host. The switch
-prints its input, output, drop and mirror counters. `make clean` removes generated
-programs and object files.
-
-## VLANs, trunk and mirror
-
-Port numbers are the one-based logical numbers printed when each host connects.
-On a fresh switch, connections take the lowest free port in order.
-
-| Option | Effect |
-| --- | --- |
-| `--vlan PORT VLAN_ID` | Sets the VLAN of a normal port. Repeat for other ports. The default is VLAN 1. |
-| `--trunk PORT` | Allows one port to send and receive any valid VLAN tag. Tags are preserved. |
-| `--mirror SOURCE SNIFFER` | Copies accepted ingress and successfully written egress traffic on one source port to a dedicated receive-only sniffer. A trunk can be the source. |
-
-For example, ports 1 and 2 share VLAN 10, port 3 is on VLAN 20, port 4 is
-the trunk and port 5 monitors port 1:
-
-```bash
-./switch 9000 5 --vlan 1 10 --vlan 2 10 --vlan 3 20 --trunk 4 --mirror 1 5
-```
-
-Use the access port's VLAN in its host input. A wrong tag is dropped before
-MAC learning. A sniffer is excluded from ordinary forwarding and its own
-input is discarded. It receives mirror copies with the original VLAN and
-priority. Copies use the sniffer's bounded queues and rate limit. A full
-sniffer queue drops the mirror copy while ordinary forwarding continues.
-The source port's `mirrored` counter counts copies queued successfully.
-
-## Live administration
-
-`swctl` uses a UNIX socket in a private directory for your user. It selects
-the switch on TCP port 9000 by default. For another instance, put
-`--port TCP_PORT` before the command.
-
-| Command | Effect |
-| --- | --- |
-| `./swctl show ports` | Show each port's state, role, access VLAN, mirror target and send rate. A zero VLAN or mirror value means no access VLAN or no mirror. |
-| `./swctl show mac` | List learned MAC addresses with their VLAN and port. |
-| `./swctl shutdown PORT` | Disconnect the host, discard queued frames and keep the slot disabled. |
-| `./swctl up PORT` | Enable the slot so a host can connect again. |
-| `./swctl vlan PORT VLAN` | Change an access port's VLAN on the existing connection. Drop old queued frames and forget that connection's learned MACs. |
-| `./swctl mirror SOURCE SNIFFER` | Replace the mirror rule. The previous sniffer becomes a normal port again if the target changes. |
-| `./swctl clear mac` | Empty the MAC table. Subsequent frames learn addresses again. |
-| `./swctl stats` | Read the latest per-port counters from POSIX shared memory. |
-| `./swctl stats --watch` | Refresh once per second. Press Ctrl+C to stop watching. |
-
-The counters reset when a fresh host connects to a port. A VLAN or mirror
-change discards affected queued frames. A write already in progress can
-finish on its current connection.
-
-Forwarding takes the read side of a shared lock, so receivers can still
-operate concurrently. VLAN, mirror and MAC clear commands take the write
-side. The forwarding lock comes before individual port locks or the MAC
-structure lock. The admission table lock comes before a port lock during
-start, shutdown and cleanup. Joins hold only the admission table lock.
-Structural MAC changes take the structure lock before bucket locks; eviction
-takes buckets in ascending order. Queue operations take the port lock before
-frame reference locks. Counter publication takes the shared stats mutex last.
-Socket writes and admin replies run outside those data locks.
-
-## Config file, signals and logs
-
-Start with `./switch 9000 3 --config switch.conf` to load a text config file.
-Here is a file for three ports:
+**In Host B**, reply directly to A. Host A should display `payload=hello A`.
 
 ```text
-# An access VLAN for each port
-vlan 1 10
-vlan 2 10
-vlan 3 20
-rate 100
+02:00:00:00:00:0a 1 1 hello A
 ```
 
-Use one directive per line. Blank lines and `#` comments are allowed.
+Each line means `destination_MAC VLAN priority message`. The all-`ff` address broadcasts to the VLAN. Priority is `0` for high, `1` for normal or `2` for low. The host supplies its own source MAC and calculates the payload length.
 
-| Directive | Effect |
-| --- | --- |
-| `vlan PORT VLAN` | The VLAN a port uses in the access role. VLAN IDs are 1–4094. |
-| `trunk PORT` or `trunk off` | Select or remove the trunk. |
-| `mirror SOURCE SNIFFER` or `mirror off` | Select or remove a mirror. The sniffer must differ from the source and the trunk. |
-| `rate FPS` | Set the send rate per port. The range is 1–10000 frames per second. |
+## 3. Check the running switch
 
-The file overrides the startup defaults and command-line flags. If a
-directive repeats, the last value is used. A reload builds a new configuration
-from the original command line and the current file, so it can replace
-settings changed with `swctl`. Connections stay up and disabled ports stay
-disabled. A port whose VLAN or role changes discards its queued frames and
-forgets its learned MACs. The TCP port, port count and positional limits
-remain startup settings.
-
-- `kill -HUP PID` reloads the configured file. A missing or invalid file is
-  rejected and the running settings stay in place.
-- `kill -USR1 PID` writes a snapshot of learned MACs, VLANs and ports to
-  `mac_table.txt`, replacing any previous dump.
-- Ctrl+C (`SIGINT`) or `kill -TERM PID` shuts down the switch, joins its
-  threads and finishes writing queued log events.
-
-`--log PATH` and `--mac-dump PATH` override `switch.log` and `mac_table.txt`.
-The logger appends UTC timestamps to switch events such as connections, MAC
-moves, port security, admin changes and signals. Worker threads enqueue
-events. The logger thread writes them outside the queue lock. Under overload,
-the bounded queue drops excess events and the logger reports the count.
-
-## Limits
-
-Defaults: **1024 VLAN/MAC entries**, **8 distinct learned MACs per port**,
-**60-second source aging**, and a **5-second admission timeout**. Destination
-lookups update LRU order but do not refresh source aging.
-
-To override defaults, provide all four extra arguments:
-
-```text
-./switch <tcp_port> <num_ports> <mac_capacity> <macs_per_port> <age_seconds> <wait_seconds>
-```
-
-For example, this allows two hosts and uses shorter limits for a demonstration:
+In **Terminal 4**, run:
 
 ```bash
-./switch 9000 2 16 4 10 3
+./swctl show ports
+./swctl show mac
+./swctl stats
 ```
 
-Capacity accepts 1–1000000, MACs per port 1–65535, age 1–86400 seconds and wait
-1–3600 seconds. TCP port and number of switch ports accept 1–65535.
+After the exchange, ports 1 and 2 should be active. The MAC table should show A on port 1 and B on port 2. Use `./swctl stats --watch` for live counters. Press Ctrl+C to leave the watch.
 
-The default send limit is **1,000 frames per second per port**. Add
-`--rate <frames_per_second>` to set the initial rate for all ports. Each port has
-its own token bucket. Place flags after the required arguments and any optional
-positional limits.
+## 4. Run with a config file and reload it
+
+The included `switch.conf` contains two lines:
+
+```text
+vlan 1 20
+rate 50
+```
+
+This puts switch port 1 on VLAN 20. Ports 2 and 3 keep the default VLAN 1. Each port can send up to 50 frames per second.
+
+1. Press **Ctrl+C in Terminal 1** to stop the first switch. Its hosts disconnect.
+2. In **Terminal 1**, start a new switch using a copy of the config. Keep this terminal open. The last line saves the switch's process ID for reloading.
+
+   ```bash
+   cp switch.conf demo.conf
+   ./switch 9000 3 --config demo.conf &
+   switch_pid=$!
+   ```
+
+3. Wait for `listening`, then restart **Host A first and Host B second** using the commands in step 2. Run `./swctl show ports` in Terminal 4. Check for `vlan=20` on port 1, `vlan=1` on port 2 and `rate=50` on both.
+4. In **Host A**, enter `ff:ff:ff:ff:ff:ff 20 1 hello VLAN 20`. Host B stays quiet because it belongs to VLAN 1.
+5. In **Terminal 1**, add port 2 to VLAN 20 and tell the running switch to reread the file:
+
+   ```bash
+   echo 'vlan 2 20' >> demo.conf
+   kill -HUP "$switch_pid"
+   ```
+
+6. After `config reloaded`, use `./swctl show ports` to confirm both ports show `vlan=20`. Send the same line from Host A again. **Host B now receives `hello VLAN 20`** on its existing connection.
+7. To stop the background switch, run `kill -TERM "$switch_pid"` in Terminal 1.
+
+### Config file format
+
+Use one setting per line. Blank lines are allowed. A `#` starts a comment. Port numbers start at 1.
+
+| Setting | Meaning |
+| --- | --- |
+| `vlan PORT VLAN` | Give an access port a VLAN from 1 to 4094. |
+| `rate FPS` | Limit each port to 1–10000 frames per second. The default is 1000. |
+| `trunk PORT` or `trunk off` | Choose one port to carry all VLANs, or turn the trunk off. |
+| `mirror SOURCE SNIFFER` or `mirror off` | Copy the source port's incoming and outgoing traffic to a separate receive-only port, or turn mirroring off. The sniffer cannot be the trunk. |
+
+## 5. Test VLANs, the trunk and port mirroring
+
+Use this as a separate demo. It uses TCP port **9001**, so every host and admin command below selects that switch. Open the terminals in the project folder.
+
+### Start the switch and connect the hosts
+
+In **Terminal 1**, start the switch and leave it running:
+
+```bash
+make
+./switch 9001 5 --vlan 1 10 --vlan 2 10 --vlan 3 20 --trunk 4
+```
+
+Wait for `listening`. Run **one command per terminal, in the order below**. After starting each host, wait for Terminal 1 to print its port number before starting the next.
+
+| Terminal | Role | Command to run |
+| --- | --- | --- |
+| 2 | A · port 1 · VLAN 10 | `./host 127.0.0.1 9001 02:00:00:00:00:0a` |
+| 3 | B · port 2 · VLAN 10 | `./host 127.0.0.1 9001 02:00:00:00:00:0b` |
+| 4 | C · port 3 · VLAN 20 | `./host 127.0.0.1 9001 02:00:00:00:00:0c` |
+| 5 | T · port 4 · trunk | `./host 127.0.0.1 9001 02:00:00:00:00:0d` |
+| 6 | M · port 5 · future sniffer | `./host 127.0.0.1 9001 02:00:00:00:00:0e` |
+| 7 | Admin | `./swctl --port 9001 show ports` |
+
+Check that all five ports say `active` and port 4 says `role=trunk`. Port 5 starts as an ordinary port on VLAN 1. Leave all hosts connected for the following tests.
+
+### Test A — VLAN isolation and trunk tags
+
+An access port belongs to one VLAN. The trunk carries frames for both VLANs and keeps the VLAN number on each frame. Type each line **inside the named host** and press Enter. Only the listed receivers should print a new `received` line.
+
+| Type in | Line to enter | Where to look |
+| --- | --- | --- |
+| A (Terminal 2) | `ff:ff:ff:ff:ff:ff 10 1 from A` | B and T receive `from A` with `vlan=10`. C stays quiet. |
+| C (Terminal 4) | `ff:ff:ff:ff:ff:ff 20 1 from C` | T receives `from C` with `vlan=20`. A and B stay quiet. |
+| T (Terminal 5) | `ff:ff:ff:ff:ff:ff 10 1 trunk to ten` | A and B receive `trunk to ten`. |
+| T (Terminal 5) | `ff:ff:ff:ff:ff:ff 20 1 trunk to twenty` | Only C receives `trunk to twenty`. |
+| A (Terminal 2) | `ff:ff:ff:ff:ff:ff 20 1 wrong tag` | Every receiver stays quiet. A's access port drops the frame because it expects VLAN 10. |
+
+### Test B — Mirror A's traffic to M
+
+In **Terminal 7**, enable the mirror and check the roles:
+
+```bash
+./swctl --port 9001 mirror 1 5
+./swctl --port 9001 show ports
+```
+
+Port 1 should show `mirror=5`. Port 5 should show `role=sniffer`. M can now see a copy when A sends **or** receives a frame. Run the first two rows back to back so A's learned MAC is still fresh.
+
+| Type in | Line to enter | Expected receivers |
+| --- | --- | --- |
+| A (Terminal 2) | `ff:ff:ff:ff:ff:ff 10 1 A is sending` | B and T receive the broadcast. M gets one mirror copy. This also teaches the switch A's MAC. |
+| B (Terminal 3) | `02:00:00:00:00:0a 10 1 private to A` | A receives the direct message. M gets one copy because A received it. T and C stay quiet. |
+| C (Terminal 4) | `ff:ff:ff:ff:ff:ff 20 1 unrelated traffic` | Only T receives it. M stays quiet because this frame never passes through A's port. |
+| M (Terminal 6) | `ff:ff:ff:ff:ff:ff 10 1 sniffer speaking` | Every receiver stays quiet. The sniffer is receive-only. |
+
+Run `./swctl --port 9001 stats` in **Terminal 7**. If you sent each row once, port 1 should show `mirrored=2`.
+
+### Test C — Change a live VLAN, disconnect a host and reconnect it
+
+1. In **Terminal 7**, run `./swctl --port 9001 vlan 2 20`. In **Host B**, enter `ff:ff:ff:ff:ff:ff 20 1 B moved`. **C and T** receive it. A and M stay quiet.
+2. In **Terminal 7**, run `./swctl --port 9001 shutdown 2`, then `./swctl --port 9001 show ports`. Port 2 says `state=down` and Host B returns to its shell.
+3. In **Terminal 7**, run `./swctl --port 9001 up 2`, then `./swctl --port 9001 show ports`. Port 2 says `state=free`. In **Terminal 3**, rerun B's host command from the setup table. Port 2 becomes `active`. Send the same `B moved` line again to confirm that C and T receive it.
+4. With the hosts idle, run `./swctl --port 9001 clear mac`, then `./swctl --port 9001 show mac` in **Terminal 7**. Expect `MAC table (0 entries)`. Send another frame from B and check again to see its MAC on port 2, VLAN 20.
+5. Press **Ctrl+C in Terminal 1** to stop this switch and disconnect its hosts.
+
+## Other commands and options
+
+| Command or option | Use |
+| --- | --- |
+| `./swctl shutdown 2` / `./swctl up 2` | Disconnect and disable port 2 / enable it for a new host connection. |
+| `./swctl vlan 2 20` / `./swctl mirror 1 3` | Move port 2 to VLAN 20 / mirror port 1 to a sniffer on port 3. |
+| `./swctl clear mac` | Clear learned MAC addresses. |
+| `./swctl --port 9001 show ports` | Select a switch started on TCP port 9001. The default is 9000. |
+| `--vlan PORT VLAN`, `--rate FPS`, `--trunk PORT`, `--mirror SOURCE SNIFFER` | Set these options directly when starting the switch. A config file can override them. |
+| `--log PATH`, `--mac-dump PATH` | Change the default log (`switch.log`) or MAC dump (`mac_table.txt`). Use `kill -USR1 "$switch_pid"` while the background switch is running to write a dump. |
+
+To change the MAC table size, MAC limit per port, aging time or wait for a free port, supply all four numbers before any flags. For example, `./switch 9000 3 1024 8 60 5` uses the defaults of 1024 entries, 8 MACs per port, 60 seconds and 5 seconds.
+
+Use `make clean` to remove the compiled programs and object files.
